@@ -1,0 +1,17 @@
+{
+  "name": "agent-shell",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fire-and-forget shell execution for AI agents: run in background, get one notify turn when done.",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "build": "bun run build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.0",
+    "typescript": "5.9.3"
+  }
+}
