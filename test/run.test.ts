@@ -7,7 +7,7 @@ const MAIN = path.join(import.meta.dir, "..", "src", "main.ts");
 
 function cli(home: string, args: string[], extraEnv: Record<string, string> = {}) {
   const p = Bun.spawnSync(["bun", MAIN, ...args], {
-    env: { ...process.env, AGENT_SHELL_HOME: home, HERDR_PANE_ID: "", ...extraEnv },
+    env: { ...process.env, AGENT_SHELL_HOME: home, HERDR_PANE_ID: "", HC_TERMINAL_ID: "", ...extraEnv },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -43,6 +43,14 @@ describe("run", () => {
     const show = cli(home, ["show", id]);
     expect(show.code).toBe(0);
     expect(show.out).toContain("hello");
+  });
+
+  test("run --wait prints the output of a quick job", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--name", "quick", "--wait", "5s", "--", "sh", "-c", "echo inline-ok"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("exit 0");
+    expect(r.out).toContain("inline-ok");
   });
 
   test("a failing command is recorded as failed", () => {
@@ -205,6 +213,48 @@ describe("check", () => {
     expect(c.out).toContain("ok finished: state is failed");
     expect(c.out).toContain("ok exit: 3");
     expect(c.out).toContain("FAIL notify: not delivered (skipped: no notify target");
+  });
+
+  function failingHerdrWithHcBin(hcLog: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hc-"));
+    fs.writeFileSync(path.join(dir, "herdr"), "#!/bin/sh\necho 'no herdr server is running' >&2\nexit 1\n");
+    fs.writeFileSync(path.join(dir, "hc"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${hcLog}"\nif [ "$1" = send ]; then exit 0; fi\necho "unexpected hc call: $*" >&2\nexit 9\n`);
+    fs.chmodSync(path.join(dir, "herdr"), 0o755);
+    fs.chmodSync(path.join(dir, "hc"), 0o755);
+    return dir;
+  }
+
+  test("notify falls back to hc send when herdr fails", () => {
+    const home = freshHome();
+    const hcLog = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hc-")), "hc.log");
+    const bin = failingHerdrWithHcBin(hcLog);
+    const r = cli(home, ["run", "--name", "probe", "--", "sh", "-c", "echo hello; exit 0"], {
+      HERDR_PANE_ID: "w9:p9",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    });
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(0);
+    expect(c.out).toContain("ok notify: notified w9:p9 via hc send");
+    expect(fs.readFileSync(hcLog, "utf8")).toContain("send w9:p9");
+  });
+
+  test("notify target defaults to the hc terminal", () => {
+    const home = freshHome();
+    const hcLog = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hc-")), "hc.log");
+    const bin = failingHerdrWithHcBin(hcLog);
+    const r = cli(home, ["run", "--name", "probe", "--", "sh", "-c", "echo hello; exit 0"], {
+      HC_TERMINAL_ID: "t9",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    });
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(0);
+    expect(c.out).toContain("ok notify: notified t9 via hc send");
   });
 
   test("running and unknown jobs exit 2", () => {

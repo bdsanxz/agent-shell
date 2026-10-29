@@ -8,6 +8,8 @@ import path from "node:path";
 
 export interface Owner {
   pane_id: string;
+  /** The herdr-core terminal that ran the job, when it runs outside old herdr. */
+  terminal_id?: string;
   agent_name: string;
   workspace_id: string;
 }

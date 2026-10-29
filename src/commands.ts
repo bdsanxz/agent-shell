@@ -64,15 +64,17 @@ Examples:
 Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] -- <command...>
 
   --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
-  --notify <target>  Who gets the notify turns: a herdr agent name or pane id.
-                     Default: your own pane ($HERDR_PANE_ID).
+  --notify <target>  Who gets the notify turns: a herdr agent name, pane id or hc terminal.
+                     Default: your own pane ($HERDR_PANE_ID) or terminal ($HC_TERMINAL_ID).
   --cwd <dir>        Directory to run in. Default: current directory.
   --heartbeat <d>    Progress notify interval with the last output line (e.g. 30s, 2m, 5m).
                      Default: 2m. Minimum: 1s. Use 0 or off to disable.
   --no-heartbeat     No progress notifies; only the completion notify is sent.
+  --wait <d>         Wait up to <d> for the job to finish (e.g. 5s, 2m), print its
+                     output and exit status, then exit. Default: do not wait.
   <command...>       The command to run (after \`--\`); use \`sh -c '...'\` for shell features.
 
-Prints the job id and the notify target, then exits at once. Never blocks.`,
+Prints the job id and the notify target, then exits at once unless --wait is given.`,
   list: `agent-shell list — list jobs (running first, then newest done)
 
 Usage: agent-shell list [--all] [--json]
@@ -443,15 +445,17 @@ function sanitizeName(name: string): string {
   return out === "" ? "job" : out;
 }
 
-function cmdRun(argv: string[]): number {
+async function cmdRun(argv: string[]): Promise<number> {
   const p = parseArgs(argv, ["no-heartbeat"]);
-  unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat"]);
+  unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat", "wait"]);
   if (bool(p, "help")) {
     console.log(HELP["run"]);
     return 0;
   }
   if (p.positionals.length === 0) throw new UsageError("run needs a command after `--`");
   const heartbeatMs = parseHeartbeatMs(str(p, "heartbeat"), bool(p, "no-heartbeat"));
+  const waitRaw = str(p, "wait");
+  const waitMs = waitRaw === undefined ? undefined : parseDurationMs(waitRaw.trim());
   const root = stateRoot();
   const id = freshId(root);
   const dir = jobDir(root, id);
@@ -493,6 +497,20 @@ function cmdRun(argv: string[]): number {
   }
   console.log(`heartbeat ${heartbeatMs === null ? "off" : `every ${formatElapsed(heartbeatMs)}`}`);
   console.log(`read with: agent-shell show ${id}`);
+  if (waitMs === undefined) return 0;
+  const deadline = Date.now() + waitMs;
+  let status = readStatus(dir);
+  while ((status?.state ?? "running") === "running" && Date.now() < deadline) {
+    await Bun.sleep(200);
+    status = readStatus(dir);
+  }
+  if ((status?.state ?? "running") === "running") {
+    console.log(`still running after ${formatElapsed(waitMs)}; read with: agent-shell show ${id}`);
+    return 0;
+  }
+  const out = tailLog(dir, 30);
+  if (out.trim() !== "") console.log(`--- output (last 30 lines) ---\n${out}`);
+  console.log(`exit ${status?.exit_code ?? "?"}`);
   return 0;
 }
 
