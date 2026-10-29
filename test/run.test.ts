@@ -80,6 +80,93 @@ describe("run", () => {
   });
 });
 
+describe("heartbeat", () => {
+  function loggingHerdrBin(logFile: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-herdr-"));
+    fs.writeFileSync(
+      path.join(dir, "herdr"),
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> "${logFile}"\nexit 0\n`,
+    );
+    fs.chmodSync(path.join(dir, "herdr"), 0o755);
+    return dir;
+  }
+
+  function readLog(logFile: string): string {
+    try {
+      return fs.readFileSync(logFile, "utf8");
+    } catch {
+      return "";
+    }
+  }
+
+  test("heartbeat defaults to 2m", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--", "sh", "-c", "sleep 30"]);
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    expect(r.out).toContain("heartbeat every 2m0s");
+    const meta = JSON.parse(fs.readFileSync(path.join(home, "jobs", id, "meta.json"), "utf8"));
+    expect(meta.heartbeat_ms).toBe(120_000);
+    expect(cli(home, ["show", id]).out).toContain("heartbeat 120000ms");
+    expect(cli(home, ["kill", id]).code).toBe(0);
+  });
+
+  test("--heartbeat and --no-heartbeat set meta; bad values exit 2", () => {
+    const home = freshHome();
+    const r1 = cli(home, ["run", "--heartbeat", "30s", "--", "sh", "-c", "sleep 30"]);
+    const id1 = r1.out.split("\n")[0]!.replace("job ", "").trim();
+    expect(JSON.parse(fs.readFileSync(path.join(home, "jobs", id1, "meta.json"), "utf8")).heartbeat_ms).toBe(30_000);
+    expect(cli(home, ["kill", id1]).code).toBe(0);
+
+    const r2 = cli(home, ["run", "--no-heartbeat", "--", "sh", "-c", "sleep 30"]);
+    const id2 = r2.out.split("\n")[0]!.replace("job ", "").trim();
+    expect(r2.out).toContain("heartbeat off");
+    expect(JSON.parse(fs.readFileSync(path.join(home, "jobs", id2, "meta.json"), "utf8")).heartbeat_ms).toBeNull();
+    expect(cli(home, ["kill", id2]).code).toBe(0);
+
+    expect(cli(home, ["run", "--heartbeat", "500ms", "--", "sh", "-c", "true"]).code).toBe(2);
+    expect(cli(home, ["run", "--heartbeat", "bogus", "--", "sh", "-c", "true"]).code).toBe(2);
+  });
+
+  test("a running job sends progress notifies with the last line, then done", () => {
+    const home = freshHome();
+    const logFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hb-")), "herdr.log");
+    const bin = loggingHerdrBin(logFile);
+    const r = cli(
+      home,
+      ["run", "--name", "slow", "--heartbeat", "1s", "--", "sh", "-c", "echo step1; sleep 3; echo step2"],
+      { HERDR_PANE_ID: "w9:p9", PATH: `${bin}:${process.env.PATH ?? ""}` },
+    );
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"'], 20000);
+    const log = readLog(logFile);
+    expect(log).toContain("still running");
+    expect(log).toContain("Last line: step1");
+    expect(log).toContain(`done (exit 0`);
+    const status = JSON.parse(fs.readFileSync(path.join(home, "jobs", id, "status.json"), "utf8"));
+    expect(status.heartbeats).toBeGreaterThanOrEqual(1);
+    expect(cli(home, ["show", id]).out).toContain("heartbeats ");
+  });
+
+  test("--no-heartbeat sends only the completion notify", () => {
+    const home = freshHome();
+    const logFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hb-")), "herdr.log");
+    const bin = loggingHerdrBin(logFile);
+    const r = cli(home, ["run", "--no-heartbeat", "--", "sh", "-c", "sleep 2"], {
+      HERDR_PANE_ID: "w9:p9",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    });
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"'], 20000);
+    const log = readLog(logFile);
+    expect(log).not.toContain("still running");
+    expect(log).toContain("done (exit 0");
+    const status = JSON.parse(fs.readFileSync(path.join(home, "jobs", id, "status.json"), "utf8"));
+    expect(status.heartbeats).toBe(0);
+  });
+});
+
 describe("check", () => {
   function fakeHerdrBin(): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-herdr-"));

@@ -12,6 +12,8 @@ export interface Owner {
   workspace_id: string;
 }
 
+export const DEFAULT_HEARTBEAT_MS = 120_000;
+
 export interface Meta {
   id: string;
   name: string;
@@ -20,6 +22,8 @@ export interface Meta {
   created_ms: number;
   owner: Owner;
   notify_target: string;
+  /** Interval between progress notifies while running; null disables them. */
+  heartbeat_ms: number | null;
   child_pid: number | null;
   supervisor_pid: number | null;
 }
@@ -31,6 +35,10 @@ export interface Status {
   duration_ms: number | null;
   notified: boolean;
   notify_detail: string;
+  /** Progress notifies sent while the job was running. */
+  heartbeats: number;
+  last_heartbeat_ms: number | null;
+  last_heartbeat_detail: string;
 }
 
 export function stateRoot(): string {
@@ -53,7 +61,12 @@ export function nowMs(): number {
 
 export function readMeta(dir: string): Meta | null {
   try {
-    return JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")) as Meta;
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")) as Partial<Meta>;
+    if (!raw || typeof (raw as Meta).id !== "string") return null;
+    return {
+      ...(raw as Meta),
+      heartbeat_ms: raw.heartbeat_ms ?? DEFAULT_HEARTBEAT_MS,
+    };
   } catch {
     return null;
   }
@@ -65,7 +78,14 @@ export function writeMeta(dir: string, meta: Meta): void {
 
 export function readStatus(dir: string): Status | null {
   try {
-    return JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")) as Status;
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")) as Partial<Status>;
+    if (!raw || typeof (raw as Status).state !== "string") return null;
+    return {
+      ...(raw as Status),
+      heartbeats: raw.heartbeats ?? 0,
+      last_heartbeat_ms: raw.last_heartbeat_ms ?? null,
+      last_heartbeat_detail: raw.last_heartbeat_detail ?? "",
+    };
   } catch {
     return null;
   }

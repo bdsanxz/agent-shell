@@ -6,6 +6,7 @@ import path from "node:path";
 import { UsageError, bool, parseArgs, str, unknownFlags } from "./args.ts";
 import { currentOwner, defaultTarget, notify } from "./notify.ts";
 import {
+  DEFAULT_HEARTBEAT_MS,
   freshId,
   jobDir,
   jobsDir,
@@ -21,7 +22,7 @@ import {
 } from "./store.ts";
 
 export const HELP: Record<string, string> = {
-  "": `agent-shell — fire-and-forget shell execution for AI agents (run in background, get one notify turn when done)
+  "": `agent-shell — fire-and-forget shell execution for AI agents (run in background, get progress and done notify turns)
 
 Usage: agent-shell <command> [options] [--help]
 
@@ -37,10 +38,13 @@ Commands:
 How it works:
   1. agent-shell run --name build -- ./scripts/test.sh
      returns at once with a job id; the command keeps running in background.
-  2. When it finishes, your session gets one notify turn:
+  2. While it runs, your session gets one progress notify turn every 2 minutes
+     (by default) with the last output line, so you can tell stuck from working.
+     Disable with --no-heartbeat, change with --heartbeat <duration>.
+  3. When it finishes, your session gets one completion notify turn:
      shell job 'build' done (exit 0). Read with: agent-shell show <id>
-  3. Read it with \`agent-shell show <id>\` or \`agent-shell tail <id>\`.
-     Nobody polls: the notify turn is the only wake-up.
+  4. Read it with \`agent-shell show <id>\` or \`agent-shell tail <id>\`.
+     Nobody polls: notify turns are the only wake-up.
 
 Environment:
   AGENT_SHELL_HOME   state root instead of ~/.local/cache/agent-shell
@@ -57,12 +61,15 @@ Examples:
   agent-shell show sh-1234-5678`,
   run: `agent-shell run — start a command in background, return its job id at once
 
-Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] -- <command...>
+Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] -- <command...>
 
   --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
-  --notify <target>  Who gets the notify turn: a herdr agent name or pane id.
+  --notify <target>  Who gets the notify turns: a herdr agent name or pane id.
                      Default: your own pane ($HERDR_PANE_ID).
   --cwd <dir>        Directory to run in. Default: current directory.
+  --heartbeat <d>    Progress notify interval with the last output line (e.g. 30s, 2m, 5m).
+                     Default: 2m. Minimum: 1s. Use 0 or off to disable.
+  --no-heartbeat     No progress notifies; only the completion notify is sent.
   <command...>       The command to run (after \`--\`); use \`sh -c '...'\` for shell features.
 
 Prints the job id and the notify target, then exits at once. Never blocks.`,
@@ -180,6 +187,7 @@ function cmdList(argv: string[]): number {
           state: status?.state ?? "running",
           exit: status?.exit_code ?? null,
           cmd: meta.command.join(" "),
+          heartbeats: status?.heartbeats ?? 0,
         }),
       );
     }
@@ -221,6 +229,12 @@ function cmdShow(argv: string[]): number {
   if (status?.duration_ms !== null && status?.duration_ms !== undefined)
     console.log(`duration_ms ${status.duration_ms}`);
   if (status?.notify_detail) console.log(`notify ${status.notify_detail}`);
+  const hb = meta.heartbeat_ms ?? DEFAULT_HEARTBEAT_MS;
+  console.log(`heartbeat ${hb === null ? "off" : `${hb}ms`}`);
+  if ((status?.heartbeats ?? 0) > 0) {
+    console.log(`heartbeats ${status!.heartbeats}`);
+    if (status?.last_heartbeat_detail) console.log(`last_heartbeat ${status.last_heartbeat_detail}`);
+  }
   console.log(`--- output (last ${tail} lines) ---`);
   const out = tailLog(dir, tail);
   if (out !== "") console.log(out);
@@ -343,6 +357,7 @@ function cmdKill(argv: string[]): number {
       // gone
     }
   }
+  const prev = readStatus(dir);
   writeStatus(dir, {
     state: "killed",
     exit_code: null,
@@ -350,6 +365,9 @@ function cmdKill(argv: string[]): number {
     duration_ms: null,
     notified: false,
     notify_detail: killed ? "killed by user; no completion notify" : "no live process found",
+    heartbeats: prev?.heartbeats ?? 0,
+    last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
+    last_heartbeat_detail: prev?.last_heartbeat_detail ?? "",
   });
   console.log(`killed ${id}`);
   return 0;
@@ -389,6 +407,32 @@ function parseDurationMs(s: string): number {
   return v * mult[unit]!;
 }
 
+/** Parse the --heartbeat value. Returns null when heartbeats are disabled. */
+function parseHeartbeatMs(raw: string | undefined, disabled: boolean): number | null {
+  if (disabled) return null;
+  if (raw === undefined) return DEFAULT_HEARTBEAT_MS;
+  const v = raw.trim().toLowerCase();
+  if (v === "" || v === "off" || v === "no" || v === "none" || v === "never" || v === "disabled") return null;
+  const ms = parseDurationMs(raw.trim());
+  if (ms === 0) return null;
+  if (ms < 1000) throw new UsageError(`bad --heartbeat '${raw}': minimum is 1s`);
+  return ms;
+}
+
+/** Last non-empty line of the job log ("" when nothing yet). */
+function lastOutputLine(dir: string): string {
+  return tailLog(dir, 5).split("\n").filter((l) => l.trim() !== "").pop() ?? "";
+}
+
+/** Short elapsed label like 45.0s, 2m5s or 1h3m. */
+function formatElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60}s`;
+  return `${Math.floor(m / 60)}h${m % 60}m`;
+}
+
 function sanitizeName(name: string): string {
   let out = name
     .split("")
@@ -400,13 +444,14 @@ function sanitizeName(name: string): string {
 }
 
 function cmdRun(argv: string[]): number {
-  const p = parseArgs(argv);
-  unknownFlags(p, ["name", "notify", "cwd"]);
+  const p = parseArgs(argv, ["no-heartbeat"]);
+  unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat"]);
   if (bool(p, "help")) {
     console.log(HELP["run"]);
     return 0;
   }
   if (p.positionals.length === 0) throw new UsageError("run needs a command after `--`");
+  const heartbeatMs = parseHeartbeatMs(str(p, "heartbeat"), bool(p, "no-heartbeat"));
   const root = stateRoot();
   const id = freshId(root);
   const dir = jobDir(root, id);
@@ -422,6 +467,7 @@ function cmdRun(argv: string[]): number {
     created_ms: nowMs(),
     owner,
     notify_target: target,
+    heartbeat_ms: heartbeatMs,
     child_pid: null,
     supervisor_pid: null,
   };
@@ -433,6 +479,9 @@ function cmdRun(argv: string[]): number {
     duration_ms: null,
     notified: false,
     notify_detail: "",
+    heartbeats: 0,
+    last_heartbeat_ms: null,
+    last_heartbeat_detail: "",
   });
   fs.writeFileSync(path.join(dir, "output.log"), "");
   spawnSupervisor(id);
@@ -442,6 +491,7 @@ function cmdRun(argv: string[]): number {
   } else {
     console.log(`notify ${target}`);
   }
+  console.log(`heartbeat ${heartbeatMs === null ? "off" : `every ${formatElapsed(heartbeatMs)}`}`);
   console.log(`read with: agent-shell show ${id}`);
   return 0;
 }
@@ -477,6 +527,7 @@ async function supervise(id: string): Promise<number> {
   meta.supervisor_pid = process.pid;
   writeMeta(dir, meta);
   const started = nowMs();
+  const heartbeatMs = meta.heartbeat_ms ?? DEFAULT_HEARTBEAT_MS;
   const logPath = path.join(dir, "output.log");
   const logFd = fs.openSync(logPath, "a");
   let proc: ReturnType<typeof Bun.spawn>;
@@ -497,15 +548,77 @@ async function supervise(id: string): Promise<number> {
       duration_ms: nowMs() - started,
       notified: false,
       notify_detail: `could not start '${meta.command.join(" ")}': ${msg}`,
+      heartbeats: 0,
+      last_heartbeat_ms: null,
+      last_heartbeat_detail: "",
     });
     return 1;
   }
   meta.child_pid = proc.pid;
   writeMeta(dir, meta);
-  const code = await proc.exited;
+
+  let heartbeats = 0;
+  let lastHeartbeatMs: number | null = null;
+  let lastHeartbeatDetail = "";
+  let finished = false;
+  let exitCode: number | undefined;
+  proc.exited.then(
+    (c) => {
+      finished = true;
+      exitCode = c;
+    },
+    () => {
+      finished = true;
+    },
+  );
+
+  // Progress notifies while the command runs: last output line every heartbeatMs.
+  // Skipped entirely when disabled or when there is no notify target.
+  // The wait races the heartbeat interval against process exit, so a job
+  // shorter than the interval finishes at once with no progress notify.
+  if (heartbeatMs !== null && meta.notify_target !== "") {
+    const done = proc.exited.then(
+      () => {},
+      () => {},
+    );
+    for (;;) {
+      await Promise.race([done, Bun.sleep(heartbeatMs)]);
+      if (finished) break;
+      if ((proc.exitCode ?? null) !== null) break;
+      const cur = readStatus(dir);
+      if (!cur || cur.state !== "running") return 0;
+      const elapsed = nowMs() - started;
+      const last = lastOutputLine(dir);
+      const hbText =
+        `shell job '${meta.name}' still running (${formatElapsed(elapsed)} elapsed). ` +
+        (last !== "" ? `Last line: ${last.slice(0, 160)}. ` : `No output yet. `) +
+        `No action needed; completion will notify. Read with: agent-shell tail ${meta.id}`;
+      const hbDetail = notify(meta.notify_target, hbText);
+      if (hbDetail.startsWith("notified")) heartbeats++;
+      lastHeartbeatMs = nowMs();
+      lastHeartbeatDetail = hbDetail;
+      writeStatus(dir, {
+        state: "running",
+        exit_code: null,
+        done_ms: null,
+        duration_ms: null,
+        notified: false,
+        notify_detail: "",
+        heartbeats,
+        last_heartbeat_ms: lastHeartbeatMs,
+        last_heartbeat_detail: lastHeartbeatDetail,
+      });
+      if (finished) break;
+    }
+  }
+
+  const code = exitCode ?? (await proc.exited);
   fs.closeSync(logFd);
+  // A kill that landed while the child exited wins: keep the killed state.
+  const cur = readStatus(dir);
+  if (cur && cur.state === "killed") return 0;
   const done = nowMs();
-  const lastLine = tailLog(dir, 5).split("\n").filter((l) => l.trim() !== "").pop() ?? "";
+  const lastLine = lastOutputLine(dir);
   const secs = ((done - started) / 1000).toFixed(1);
   let text = `shell job '${meta.name}' done (exit ${code}, ${secs}s). Read with: agent-shell show ${meta.id}`;
   if (lastLine !== "") text += ` Last line: ${lastLine.slice(0, 160)}`;
@@ -517,6 +630,9 @@ async function supervise(id: string): Promise<number> {
     duration_ms: done - started,
     notified: detail.startsWith("notified"),
     notify_detail: detail,
+    heartbeats,
+    last_heartbeat_ms: lastHeartbeatMs,
+    last_heartbeat_detail: lastHeartbeatDetail,
   });
   return 0;
 }
