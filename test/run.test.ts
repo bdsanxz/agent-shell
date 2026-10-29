@@ -79,3 +79,71 @@ describe("run", () => {
     expect(cli(home, ["nope"]).code).toBe(2);
   });
 });
+
+describe("check", () => {
+  function fakeHerdrBin(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-herdr-"));
+    fs.writeFileSync(path.join(dir, "herdr"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(path.join(dir, "herdr"), 0o755);
+    return dir;
+  }
+
+  test("a finished job with delivered notify passes 4/4", () => {
+    const home = freshHome();
+    const bin = fakeHerdrBin();
+    const r = cli(
+      home,
+      ["run", "--name", "probe", "--", "sh", "-c", "echo hello; exit 0"],
+      { HERDR_PANE_ID: "w9:p9", PATH: `${bin}:${process.env.PATH ?? ""}` },
+    );
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(0);
+    expect(c.out).toContain("ok finished: state is done");
+    expect(c.out).toContain("ok exit: 0");
+    expect(c.out).toContain("ok output: 1 lines");
+    expect(c.out).toContain("ok notify: notified w9:p9");
+    expect(c.out).toContain(`check ${id}: 4/4 pass`);
+  });
+
+  test("a failed job still reports its recorded exit, notify failure fails the check", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--name", "bad", "--", "sh", "-c", "exit 3"]);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"failed"']);
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(1);
+    expect(c.out).toContain("ok finished: state is failed");
+    expect(c.out).toContain("ok exit: 3");
+    expect(c.out).toContain("FAIL notify: not delivered (skipped: no notify target");
+  });
+
+  test("running and unknown jobs exit 2", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--name", "long", "--", "sh", "-c", "sleep 30"]);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(2);
+    expect(c.err).toContain("still running");
+    expect(cli(home, ["kill", id]).code).toBe(0);
+    waitFor(home, id, ['"killed"']);
+    const k = cli(home, ["check", id]);
+    expect(k.code).toBe(1);
+    expect(k.out).toContain("FAIL finished: state is killed");
+    expect(cli(home, ["check", "sh-nope"]).code).toBe(2);
+    expect(cli(home, ["clean"]).out).toContain("removed 1");
+  });
+
+  test("a missing output log fails the output check", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--name", "probe", "--", "sh", "-c", "echo hi"]);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    fs.rmSync(path.join(home, "jobs", id, "output.log"));
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(1);
+    expect(c.out).toContain("FAIL output: output.log is missing or unreadable");
+  });
+});

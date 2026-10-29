@@ -30,6 +30,7 @@ Commands:
   list       List jobs (running first, then newest done)
   show       Show one job: status plus the tail of its output
   tail       Print the tail of one job's output
+  check      Verify one finished job: state, exit, output and notify
   kill       Stop a running job (SIGTERM, then SIGKILL)
   clean      Remove finished job directories
 
@@ -81,6 +82,21 @@ Usage: agent-shell show <id> [--tail <n>]
 Usage: agent-shell tail <id> [--lines <n>]
 
   --lines <n>   Lines to print. Default: 50.`,
+  check: `agent-shell check — verify one finished job before using its result
+
+Usage: agent-shell check <id>
+
+Prints one line per check with its concrete value, then a summary line:
+
+  ok finished: state is done
+  ok exit: 0
+  ok output: 12 lines
+  ok notify: notified w1:p1
+  check sh-1234-5678: 4/4 pass
+
+Exit 0 when all four pass, 1 when any fails, 2 when the job is
+unknown or still running. A killed job fails the finished check:
+its output is partial and it never got a completion notify.`,
   kill: `agent-shell kill — stop a running job (SIGTERM, then SIGKILL)
 
 Usage: agent-shell kill <id>
@@ -109,6 +125,8 @@ export async function dispatch(cmd: string, argv: string[]): Promise<number> {
       return cmdShow(argv);
     case "tail":
       return cmdTail(argv);
+    case "check":
+      return cmdCheck(argv);
     case "kill":
       return cmdKill(argv);
     case "clean":
@@ -224,6 +242,53 @@ function cmdTail(argv: string[]): number {
   const out = tailLog(dir, lines);
   if (out !== "") console.log(out);
   return 0;
+}
+
+function cmdCheck(argv: string[]): number {
+  const p = parseArgs(argv);
+  unknownFlags(p, []);
+  if (bool(p, "help")) {
+    console.log(HELP["check"]);
+    return 0;
+  }
+  const id = p.positionals[0];
+  if (!id || p.positionals.length !== 1) throw new UsageError("check needs exactly one <id>");
+  const dir = jobDir(stateRoot(), id);
+  const meta = readMeta(dir);
+  if (!meta) throw new UsageError(`unknown job ${id}`);
+  const status = readStatus(dir);
+  const state = status?.state ?? "running";
+  if (state === "running")
+    throw new UsageError(`job ${id} is still running; check it after its notify turn arrives`);
+  let pass = 0;
+  const line = (ok: boolean, text: string) => {
+    console.log(`${ok ? "ok" : "FAIL"} ${text}`);
+    if (ok) pass++;
+  };
+  line(
+    state === "done" || state === "failed",
+    state === "killed"
+      ? `finished: state is killed (partial output kept, no completion notify)`
+      : `finished: state is ${state}`,
+  );
+  const code = status?.exit_code;
+  line(code !== null && code !== undefined, code !== null && code !== undefined ? `exit: ${code}` : `exit: no exit code recorded`);
+  const logPath = path.join(dir, "output.log");
+  let lines: string[] | null = null;
+  try {
+    const text = fs.readFileSync(logPath, "utf8");
+    const all = text.split("\n");
+    if (all.length > 0 && all[all.length - 1] === "") all.pop();
+    lines = all;
+  } catch {
+    lines = null;
+  }
+  line(lines !== null, lines !== null ? `output: ${lines.length} lines` : `output: output.log is missing or unreadable`);
+  const notified = status?.notified === true;
+  const detail = status?.notify_detail ?? "";
+  line(notified, notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`);
+  console.log(`check ${id}: ${pass}/4 pass`);
+  return pass === 4 ? 0 : 1;
 }
 
 function cmdKill(argv: string[]): number {

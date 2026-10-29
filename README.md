@@ -19,6 +19,7 @@ agent-shell run --name build -- bun test
 agent-shell list
 agent-shell show sh-1234-5678
 agent-shell tail sh-1234-5678 --lines 50
+agent-shell check sh-1234-5678
 agent-shell kill sh-1234-5678
 agent-shell clean --older-than 7d
 ```
@@ -27,7 +28,8 @@ agent-shell clean --older-than 7d
 background under a detached supervisor. When it finishes, the supervisor sends one
 `herdr agent prompt` turn to the notify target (your own pane by default, or `--notify`)
 and records the job as done or failed. Nothing polls, nothing waits: the notify turn
-is the only wake-up. Read the output with `show` or `tail`.
+is the only wake-up. Read the output with `show` or `tail`, and verify a finished
+job before using its result with `check` (state, exit, output and notify).
 
 Run `agent-shell <command> --help` before you first use a command.
 
