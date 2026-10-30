@@ -26,14 +26,17 @@ agent-shell clean --older-than 7d
 
 `run` returns at once with a job id and exits: the command keeps running in
 background under a detached supervisor. While it runs, the supervisor sends one
-progress `herdr agent prompt` turn every 2 minutes by default (`--heartbeat
-<duration>` changes it, `--no-heartbeat` disables it), each carrying the last
-output line so you can tell stuck from working. When it finishes, the supervisor
-sends one completion turn to the notify target (your own pane by default, or
-`--notify`) and records the job as done or failed. Nothing polls, nothing waits:
-notify turns are the only wake-up. Read the output with `show` or `tail`, and
-verify a finished job before using its result with `check` (state, exit, output
-and notify).
+progress notify turn every 2 minutes by default (`--heartbeat <duration>`
+changes it, `--no-heartbeat` disables it), each carrying the last output line so
+you can tell stuck from working. When it finishes, the supervisor sends one
+completion turn to the notify target (your own pane by default, or `--notify`)
+and records the job as done or failed. Notify turns go over the old herdr server
+(`herdr agent prompt`) when it runs, else herdr-core: a target whose live terminal
+kind is an agent gets `hcx send` (untagged, with a sender footer); a shell kind,
+or a kind that cannot be determined, keeps `hc send` (tagged). Nothing polls,
+nothing waits: notify turns are the only wake-up. Read the output with `show` or
+`tail`, and verify a finished job before using its result with `check` (state,
+exit, output, completion and last progress notify).
 
 Run `agent-shell <command> --help` before you first use a command.
 

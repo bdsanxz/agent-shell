@@ -45,6 +45,9 @@ How it works:
      shell job 'build' done (exit 0). Read with: agent-shell show <id>
   4. Read it with \`agent-shell show <id>\` or \`agent-shell tail <id>\`.
      Nobody polls: notify turns are the only wake-up.
+  Notify turns go over the old herdr server (\`herdr agent prompt\`) when it runs,
+  else herdr-core. There, a target whose live terminal kind is an agent gets
+  \`hcx send\` (untagged); a shell kind, or an unknown kind, keeps \`hc send\`.
 
 Environment:
   AGENT_SHELL_HOME   state root instead of ~/.local/cache/agent-shell
@@ -65,7 +68,10 @@ Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--hear
 
   --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
   --notify <target>  Who gets the notify turns: a herdr agent name, pane id or hc terminal.
-                     Default: your own pane ($HERDR_PANE_ID) or terminal ($HC_TERMINAL_ID).
+                     An agent terminal is notified untagged (\`hcx send\`); a shell
+                     terminal, or one whose kind is unknown, keeps the tagged
+                     \`hc send\`. Default: your own pane ($HERDR_PANE_ID) or terminal
+                     ($HC_TERMINAL_ID).
   --cwd <dir>        Directory to run in. Default: current directory.
   --heartbeat <d>    Progress notify interval with the last output line (e.g. 30s, 2m, 5m).
                      Default: 2m. Minimum: 1s. Use 0 or off to disable.
@@ -105,7 +111,10 @@ Prints one line per check with its concrete value, then a summary line:
 
 Exit 0 when all four pass, 1 when any fails, 2 when the job is
 unknown or still running. A killed job fails the finished check:
-its output is partial and it never got a completion notify.`,
+its output is partial and it never got a completion notify.
+
+When progress notifies were sent, the last one prints as \`progress notify: ...\`
+after the notify line. It is informational and does not change the pass count.`,
   kill: `agent-shell kill — stop a running job (SIGTERM, then SIGKILL)
 
 Usage: agent-shell kill <id>
@@ -233,10 +242,8 @@ function cmdShow(argv: string[]): number {
   if (status?.notify_detail) console.log(`notify ${status.notify_detail}`);
   const hb = meta.heartbeat_ms ?? DEFAULT_HEARTBEAT_MS;
   console.log(`heartbeat ${hb === null ? "off" : `${hb}ms`}`);
-  if ((status?.heartbeats ?? 0) > 0) {
-    console.log(`heartbeats ${status!.heartbeats}`);
-    if (status?.last_heartbeat_detail) console.log(`last_heartbeat ${status.last_heartbeat_detail}`);
-  }
+  if ((status?.heartbeats ?? 0) > 0) console.log(`heartbeats ${status!.heartbeats}`);
+  if (status?.last_heartbeat_detail) console.log(`last_heartbeat ${status.last_heartbeat_detail}`);
   console.log(`--- output (last ${tail} lines) ---`);
   const out = tailLog(dir, tail);
   if (out !== "") console.log(out);
@@ -303,6 +310,10 @@ function cmdCheck(argv: string[]): number {
   const notified = status?.notified === true;
   const detail = status?.notify_detail ?? "";
   line(notified, notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`);
+  // The last progress notify is informational: a failure here is visible, but only
+  // the completion notify decides whether the job's result is trusted.
+  const lastProgress = status?.last_heartbeat_detail ?? "";
+  if (lastProgress !== "") console.log(`progress notify: ${lastProgress}`);
   console.log(`check ${id}: ${pass}/4 pass`);
   return pass === 4 ? 0 : 1;
 }

@@ -18,6 +18,11 @@ function freshHome(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-test-"));
 }
 
+/** A PATH with only the stub dir and the runtime: no real herdr, hc or hcx. */
+function minimalPath(bin: string): string {
+  return `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`;
+}
+
 function waitFor(home: string, id: string, want: string[], timeoutMs = 15000): string {
   const statusPath = path.join(home, "jobs", id, "status.json");
   const t0 = Date.now();
@@ -230,7 +235,7 @@ describe("check", () => {
     const bin = failingHerdrWithHcBin(hcLog);
     const r = cli(home, ["run", "--name", "probe", "--", "sh", "-c", "echo hello; exit 0"], {
       HERDR_PANE_ID: "w9:p9",
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      PATH: minimalPath(bin),
     });
     expect(r.code).toBe(0);
     const id = r.out.split("\n")[0]!.replace("job ", "").trim();
@@ -247,7 +252,7 @@ describe("check", () => {
     const bin = failingHerdrWithHcBin(hcLog);
     const r = cli(home, ["run", "--name", "probe", "--", "sh", "-c", "echo hello; exit 0"], {
       HC_TERMINAL_ID: "t9",
-      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      PATH: minimalPath(bin),
     });
     expect(r.code).toBe(0);
     const id = r.out.split("\n")[0]!.replace("job ", "").trim();
@@ -282,5 +287,178 @@ describe("check", () => {
     const c = cli(home, ["check", id]);
     expect(c.code).toBe(1);
     expect(c.out).toContain("FAIL output: output.log is missing or unreadable");
+  });
+});
+
+describe("notify route", () => {
+  interface Terminal {
+    address: string;
+    name?: string;
+    agent?: string;
+  }
+
+  /** A stub bin: `hc ls --json` prints `terminals`, `hc send` and `hcx send` log their
+   * arguments. `terminals: null` makes `hc ls` fail, so no kind can be determined. */
+  function routeBin(spec: {
+    logDir: string;
+    herdr?: "ok" | "fail";
+    hcx?: "ok" | "fail";
+    hc?: "ok" | "fail";
+    terminals?: Terminal[] | null;
+  }): string {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-route-"));
+    const write = (name: string, body: string) => {
+      const p = path.join(bin, name);
+      fs.writeFileSync(p, body);
+      fs.chmodSync(p, 0o755);
+    };
+    if (spec.herdr === "ok") write("herdr", "#!/bin/sh\nexit 0\n");
+    if (spec.herdr === "fail") write("herdr", "#!/bin/sh\necho 'no herdr server is running' >&2\nexit 1\n");
+    if (spec.hcx === "ok") write("hcx", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hcx.log"\nexit 0\n`);
+    if (spec.hcx === "fail") write("hcx", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hcx.log"\necho 'hcx is broken' >&2\nexit 1\n`);
+    if (spec.hc === "ok") {
+      const listing =
+        spec.terminals === null
+          ? "echo 'no terminal list' >&2\nexit 1"
+          : `printf '%s\\n' '${JSON.stringify({ terminals: spec.terminals ?? [] })}'\nexit 0`;
+      write(
+        "hc",
+        `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hc.log"\nif [ "$1" = ls ]; then\n${listing}\nfi\nexit 0\n`,
+      );
+    }
+    if (spec.hc === "fail") write("hc", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hc.log"\necho 'hc is broken' >&2\nexit 1\n`);
+    return bin;
+  }
+
+  function freshLogDir(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-route-log-"));
+  }
+
+  function readLog(file: string): string {
+    try {
+      return fs.readFileSync(file, "utf8");
+    } catch {
+      return "";
+    }
+  }
+
+  /** The `send` calls a stub recorded, without its `ls --json` lookups. */
+  function sends(file: string): string[] {
+    return readLog(file)
+      .split("\n")
+      .filter((l) => l.startsWith("send "));
+  }
+
+  function runProbe(home: string, bin: string, args: string[], extraEnv: Record<string, string> = {}) {
+    return cli(home, ["run", "--name", "probe", ...args, "--", "sh", "-c", "echo hello; exit 0"], {
+      PATH: minimalPath(bin),
+      ...extraEnv,
+    });
+  }
+
+  /** Run one quick job and return its finished `check` output. */
+  function probeCheck(home: string, bin: string, args: string[], extraEnv: Record<string, string> = {}) {
+    const r = runProbe(home, bin, args, extraEnv);
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    return cli(home, ["check", id]);
+  }
+
+  test("an agent terminal kind is notified untagged via hcx", () => {
+    for (const kind of ["muse", "claude-code", "opencode"]) {
+      const home = freshHome();
+      const logDir = freshLogDir();
+      const bin = routeBin({ hcx: "ok", hc: "ok", logDir, terminals: [{ address: "t7", agent: kind }] });
+      const c = probeCheck(home, bin, ["--notify", "t7"]);
+      expect(`${kind}: ${c.out}`).toContain("ok notify: notified t7 via hcx send");
+      expect(`${kind}: ${JSON.stringify(sends(path.join(logDir, "hcx.log")))}`).toContain("send t7 shell job 'probe' done");
+      expect(sends(path.join(logDir, "hc.log"))).toHaveLength(0);
+    }
+  });
+
+  test("a target that matches a terminal name resolves its kind too", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      logDir,
+      terminals: [{ address: "t7", name: "Vrax", agent: "muse" }],
+    });
+    const c = probeCheck(home, bin, ["--notify", "Vrax"]);
+    expect(c.out).toContain("ok notify: notified Vrax via hcx send");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(1);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(0);
+  });
+
+  test("a shell terminal kind keeps the tagged send and never calls hcx", () => {
+    for (const kind of ["zsh", "bash"]) {
+      const home = freshHome();
+      const logDir = freshLogDir();
+      const bin = routeBin({ hcx: "ok", hc: "ok", logDir, terminals: [{ address: "t7", agent: kind }] });
+      const c = probeCheck(home, bin, ["--notify", "t7"]);
+      expect(`${kind}: ${c.out}`).toContain("ok notify: notified t7 via hc send");
+      expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(0);
+      expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
+    }
+  });
+
+  test("an unknown kind keeps the tagged send and never calls hcx", () => {
+    // The target is not in the live terminal list.
+    const home1 = freshHome();
+    const logDir1 = freshLogDir();
+    const bin1 = routeBin({ hcx: "ok", hc: "ok", logDir: logDir1, terminals: [{ address: "t9", agent: "muse" }] });
+    const c1 = probeCheck(home1, bin1, ["--notify", "t7"]);
+    expect(c1.out).toContain("ok notify: notified t7 via hc send");
+    expect(sends(path.join(logDir1, "hcx.log"))).toHaveLength(0);
+    expect(sends(path.join(logDir1, "hc.log"))).toHaveLength(1);
+
+    // The terminal list itself is unreadable.
+    const home2 = freshHome();
+    const logDir2 = freshLogDir();
+    const bin2 = routeBin({ hcx: "ok", hc: "ok", logDir: logDir2, terminals: null });
+    const c2 = probeCheck(home2, bin2, ["--notify", "t7"]);
+    expect(c2.out).toContain("ok notify: notified t7 via hc send");
+    expect(sends(path.join(logDir2, "hcx.log"))).toHaveLength(0);
+  });
+
+  test("hcx absent uses hc send", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({ hc: "ok", logDir, terminals: [{ address: "t7", agent: "muse" }] });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hc send");
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
+  });
+
+  test("a failing hcx falls back to hc send and says so", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({ hcx: "fail", hc: "ok", logDir, terminals: [{ address: "t7", agent: "muse" }] });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hc send (hcx failed: hcx is broken)");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(1);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
+  });
+
+  test("check prints the last progress notify", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({ hcx: "ok", hc: "ok", logDir });
+    const herdr = path.join(bin, "herdr");
+    fs.writeFileSync(herdr, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${logDir}/herdr.log"\nexit 0\n`);
+    fs.chmodSync(herdr, 0o755);
+    const r = cli(home, ["run", "--name", "slow", "--heartbeat", "1s", "--", "sh", "-c", "echo step1; sleep 3"], {
+      HERDR_PANE_ID: "w9:p9",
+      PATH: minimalPath(bin),
+    });
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"'], 20000);
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(0);
+    expect(c.out).toContain("progress notify: notified w9:p9");
+    expect(readLog(path.join(logDir, "herdr.log"))).toContain("still running");
   });
 });
