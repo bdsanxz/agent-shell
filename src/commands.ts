@@ -47,7 +47,8 @@ How it works:
      Nobody polls: notify turns are the only wake-up.
   Notify turns go over the old herdr server (\`herdr agent prompt\`) when it runs,
   else herdr-core. There, a target whose live terminal kind is an agent gets
-  \`hcx send\` (untagged); a shell kind, or an unknown kind, keeps \`hc send\`.
+  \`hcx send --no-footer\` (untagged, no sender footer; needs hcx 0.1.3 or newer);
+  a shell kind, or an unknown kind, keeps \`hc send\`.
 
 Environment:
   AGENT_SHELL_HOME   state root instead of ~/.local/cache/agent-shell
@@ -68,7 +69,8 @@ Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--hear
 
   --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
   --notify <target>  Who gets the notify turns: a herdr agent name, pane id or hc terminal.
-                     An agent terminal is notified untagged (\`hcx send\`); a shell
+                     An agent terminal is notified untagged with no sender footer
+                     (\`hcx send --no-footer\`, needs hcx 0.1.3 or newer); a shell
                      terminal, or one whose kind is unknown, keeps the tagged
                      \`hc send\`. Default: your own pane ($HERDR_PANE_ID) or terminal
                      ($HC_TERMINAL_ID).

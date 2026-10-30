@@ -32,11 +32,14 @@ you can tell stuck from working. When it finishes, the supervisor sends one
 completion turn to the notify target (your own pane by default, or `--notify`)
 and records the job as done or failed. Notify turns go over the old herdr server
 (`herdr agent prompt`) when it runs, else herdr-core: a target whose live terminal
-kind is an agent gets `hcx send` (untagged, with a sender footer); a shell kind,
-or a kind that cannot be determined, keeps `hc send` (tagged). Nothing polls,
-nothing waits: notify turns are the only wake-up. Read the output with `show` or
-`tail`, and verify a finished job before using its result with `check` (state,
-exit, output, completion and last progress notify).
+kind is an agent gets `hcx send --no-footer` (untagged, with no sender footer;
+needs hcx 0.1.3 or newer, otherwise the tagged `hc send`); a tab whose agent is a
+plain shell is checked for its foreground program (an opencode tab is an agent,
+not a shell); a real shell, or a kind that cannot be determined, keeps
+`hc send` (tagged). Nothing polls, nothing waits: notify turns are the only
+wake-up. Read the output with `show` or `tail`, and verify a finished job before
+using its result with `check` (state, exit, output, completion and last progress
+notify).
 
 Run `agent-shell <command> --help` before you first use a command.
 

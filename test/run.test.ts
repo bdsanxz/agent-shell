@@ -297,14 +297,20 @@ describe("notify route", () => {
     agent?: string;
   }
 
-  /** A stub bin: `hc ls --json` prints `terminals`, `hc send` and `hcx send` log their
-   * arguments. `terminals: null` makes `hc ls` fail, so no kind can be determined. */
+  /** A stub bin: `hc ls --json` prints `terminals`, `hc get <addr>` prints
+   * `foreground`, and `hc send` / `hcx send` log their arguments. `hcx --version`
+   * prints `hcxVersion` (default `hcx 0.1.3`), so `send --no-footer` is supported
+   * unless a test opts out. `terminals: null` makes `hc ls` fail, so no kind can
+   * be determined. `foreground: "fail"` and `"bogus"` make `hc get` fail or print
+   * unparseable JSON. */
   function routeBin(spec: {
     logDir: string;
     herdr?: "ok" | "fail";
     hcx?: "ok" | "fail";
     hc?: "ok" | "fail";
+    hcxVersion?: string;
     terminals?: Terminal[] | null;
+    foreground?: { name: string } | "fail" | "bogus";
   }): string {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-route-"));
     const write = (name: string, body: string) => {
@@ -314,16 +320,31 @@ describe("notify route", () => {
     };
     if (spec.herdr === "ok") write("herdr", "#!/bin/sh\nexit 0\n");
     if (spec.herdr === "fail") write("herdr", "#!/bin/sh\necho 'no herdr server is running' >&2\nexit 1\n");
-    if (spec.hcx === "ok") write("hcx", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hcx.log"\nexit 0\n`);
-    if (spec.hcx === "fail") write("hcx", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hcx.log"\necho 'hcx is broken' >&2\nexit 1\n`);
+    if (spec.hcx === "ok" || spec.hcx === "fail") {
+      const version = spec.hcxVersion ?? "hcx 0.1.3";
+      let body = `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hcx.log"\n`;
+      body += `if [ "$1" = "--version" ]; then printf '%s\\n' '${version}'; exit 0; fi\n`;
+      if (spec.hcx === "fail") {
+        body += "echo 'hcx is broken' >&2\nexit 1\n";
+      } else {
+        body += 'if [ "$1" = "send" ]; then exit 0; fi\necho "unexpected hcx call: $*" >&2\nexit 9\n';
+      }
+      write("hcx", body);
+    }
     if (spec.hc === "ok") {
       const listing =
         spec.terminals === null
           ? "echo 'no terminal list' >&2\nexit 1"
           : `printf '%s\\n' '${JSON.stringify({ terminals: spec.terminals ?? [] })}'\nexit 0`;
+      const get =
+        spec.foreground === "fail"
+          ? "echo 'no foreground' >&2\nexit 1"
+          : spec.foreground === "bogus"
+            ? "printf '%s\\n' 'not json'\nexit 0"
+            : `printf '%s\\n' '${JSON.stringify({ foreground: spec.foreground ?? {} })}'\nexit 0`;
       write(
         "hc",
-        `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hc.log"\nif [ "$1" = ls ]; then\n${listing}\nfi\nexit 0\n`,
+        `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hc.log"\nif [ "$1" = ls ]; then\n${listing}\nfi\nif [ "$1" = get ]; then\n${get}\nfi\nexit 0\n`,
       );
     }
     if (spec.hc === "fail") write("hc", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hc.log"\necho 'hc is broken' >&2\nexit 1\n`);
@@ -371,8 +392,8 @@ describe("notify route", () => {
       const logDir = freshLogDir();
       const bin = routeBin({ hcx: "ok", hc: "ok", logDir, terminals: [{ address: "t7", agent: kind }] });
       const c = probeCheck(home, bin, ["--notify", "t7"]);
-      expect(`${kind}: ${c.out}`).toContain("ok notify: notified t7 via hcx send");
-      expect(`${kind}: ${JSON.stringify(sends(path.join(logDir, "hcx.log")))}`).toContain("send t7 shell job 'probe' done");
+      expect(`${kind}: ${c.out}`).toContain("ok notify: notified t7 via hcx send --no-footer");
+      expect(`${kind}: ${JSON.stringify(sends(path.join(logDir, "hcx.log")))}`).toContain("send --no-footer t7 shell job 'probe' done");
       expect(sends(path.join(logDir, "hc.log"))).toHaveLength(0);
     }
   });
@@ -387,9 +408,41 @@ describe("notify route", () => {
       terminals: [{ address: "t7", name: "Vrax", agent: "muse" }],
     });
     const c = probeCheck(home, bin, ["--notify", "Vrax"]);
-    expect(c.out).toContain("ok notify: notified Vrax via hcx send");
+    expect(c.out).toContain("ok notify: notified Vrax via hcx send --no-footer");
     expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(1);
     expect(sends(path.join(logDir, "hc.log"))).toHaveLength(0);
+  });
+
+  test("an hcx older than 0.1.3 keeps the tagged send and says why", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      hcxVersion: "hcx 0.1.2",
+      logDir,
+      terminals: [{ address: "t7", agent: "muse" }],
+    });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hc send (hcx older than 0.1.3)");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(0);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
+  });
+
+  test("an unparseable hcx version keeps the tagged send and says why", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      hcxVersion: "hcx pre-release",
+      logDir,
+      terminals: [{ address: "t7", agent: "muse" }],
+    });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hc send (hcx version unknown");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(0);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
   });
 
   test("a shell terminal kind keeps the tagged send and never calls hcx", () => {
@@ -401,7 +454,90 @@ describe("notify route", () => {
       expect(`${kind}: ${c.out}`).toContain("ok notify: notified t7 via hc send");
       expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(0);
       expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
+      expect(readLog(path.join(logDir, "hcx.log"))).toBe("");
     }
+  });
+
+  test("a shell kind with a shell foreground stays a shell: tagged send", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      logDir,
+      terminals: [{ address: "t7", agent: "zsh" }],
+      foreground: { name: "zsh" },
+    });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hc send");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(0);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
+    expect(readLog(path.join(logDir, "hcx.log"))).toBe("");
+  });
+
+  test("an opencode tab (zsh agent, opencode foreground) is an agent: untagged hcx", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      logDir,
+      terminals: [{ address: "t7", agent: "zsh" }],
+      foreground: { name: "opencode" },
+    });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hcx send --no-footer");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(1);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(0);
+    expect(readLog(path.join(logDir, "hc.log"))).toContain("get t7");
+  });
+
+  test("a claude-code tab with a version-string foreground stays claude-code", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      logDir,
+      terminals: [{ address: "t7", agent: "claude-code" }],
+      foreground: { name: "2.1.314" },
+    });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hcx send --no-footer");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(1);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(0);
+  });
+
+  test("a failing hc get keeps the shell kind: tagged send", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      logDir,
+      terminals: [{ address: "t7", agent: "zsh" }],
+      foreground: "fail",
+    });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hc send");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(0);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
+  });
+
+  test("an unparseable hc get keeps the shell kind: tagged send", () => {
+    const home = freshHome();
+    const logDir = freshLogDir();
+    const bin = routeBin({
+      hcx: "ok",
+      hc: "ok",
+      logDir,
+      terminals: [{ address: "t7", agent: "zsh" }],
+      foreground: "bogus",
+    });
+    const c = probeCheck(home, bin, ["--notify", "t7"]);
+    expect(c.out).toContain("ok notify: notified t7 via hc send");
+    expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(0);
+    expect(sends(path.join(logDir, "hc.log"))).toHaveLength(1);
   });
 
   test("an unknown kind keeps the tagged send and never calls hcx", () => {
