@@ -24,22 +24,30 @@ agent-shell kill sh-1234-5678
 agent-shell clean --older-than 7d
 ```
 
-`run` returns at once with a job id and exits: the command keeps running in
+`run` validates `--cwd` and the executable up front (exit 2, no job created),
+then returns at once with a job id and exits: the command keeps running in
 background under a detached supervisor. While it runs, the supervisor sends one
 progress notify turn every 2 minutes by default (`--heartbeat <duration>`
-changes it, `--no-heartbeat` disables it), each carrying the last output line so
-you can tell stuck from working. When it finishes, the supervisor sends one
-completion turn to the notify target (your own pane by default, or `--notify`)
-and records the job as done or failed. Notify turns go over the old herdr server
+changes it; `--no-heartbeat`, `--heartbeat 0` and `off` disable it), each
+carrying the last output line so you can tell stuck from working. When it
+finishes, the supervisor records the job as done or failed first, then sends
+one completion turn to the notify target (your own pane by default, or
+`--notify`). A job that cannot start still sends the completion notify with
+the start error, recorded in the job's `error` field. Notify turns go over the old herdr server
 (`herdr agent prompt`) when it runs, else herdr-core: a target whose live terminal
 kind is an agent gets `hcx send --no-footer` (untagged, with no sender footer;
 needs hcx 0.1.3 or newer, otherwise the tagged `hc send`); a tab whose agent is a
 plain shell is checked for its foreground program (an opencode tab is an agent,
 not a shell); a real shell, or a kind that cannot be determined, keeps
 `hc send` (tagged). Nothing polls, nothing waits: notify turns are the only
-wake-up. Read the output with `show` or `tail`, and verify a finished job before
-using its result with `check` (state, exit, output, completion and last progress
-notify).
+wake-up. Read the output with `show` or `tail` (`--tail`/`--lines` need a
+positive integer), and verify a finished job before using its result with
+`check` (state, exit, output, completion and last progress notify, plus a
+separate `success` line for the job's own outcome). `check` exits 0 only when
+the records pass and the job succeeded (exit 0); a job with no notify target
+reports `notify: n/a`, not a failure. `run --wait` exits with the job's exit
+code (124 on timeout). `kill` refuses unless the job is running (exit 2) and
+only signals the child when its start time still matches.
 
 Run `agent-shell <command> --help` before you first use a command.
 

@@ -36,7 +36,7 @@ export function currentOwner(): Owner {
 
 function haveHerdr(): boolean {
   try {
-    const p = spawnSync("sh", ["-c", "command -v herdr"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const p = spawnSync("sh", ["-c", "command -v herdr"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
     return p.status === 0 && (p.stdout as string).trim() !== "";
   } catch {
     return false;
@@ -45,7 +45,7 @@ function haveHerdr(): boolean {
 
 function haveHc(): boolean {
   try {
-    const p = spawnSync("sh", ["-c", "command -v hc"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const p = spawnSync("sh", ["-c", "command -v hc"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
     return p.status === 0 && (p.stdout as string).trim() !== "";
   } catch {
     return false;
@@ -54,7 +54,7 @@ function haveHc(): boolean {
 
 function haveHcx(): boolean {
   try {
-    const p = spawnSync("sh", ["-c", "command -v hcx"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const p = spawnSync("sh", ["-c", "command -v hcx"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
     return p.status === 0 && (p.stdout as string).trim() !== "";
   } catch {
     return false;
@@ -69,7 +69,7 @@ const SHELLS = new Set(["zsh", "sh", "bash", "fish", "dash", "ksh", "nu", "pwsh"
  * unparseable, or the shape has no name. */
 function hcForeground(address: string): string {
   try {
-    const p = spawnSync("hc", ["get", address], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const p = spawnSync("hc", ["get", address], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
     if (p.status !== 0) return "";
     const v = JSON.parse(p.stdout as string) as { foreground?: unknown };
     if (typeof v.foreground !== "object" || v.foreground === null) return "";
@@ -87,7 +87,7 @@ function hcForeground(address: string): string {
  * its foreground program wins (an opencode login shell is an agent, not a shell). */
 function hcTargetKind(target: string): string {
   try {
-    const p = spawnSync("hc", ["ls", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const p = spawnSync("hc", ["ls", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
     if (p.status !== 0) return "";
     const v = JSON.parse(p.stdout as string) as { terminals?: unknown };
     if (!Array.isArray(v.terminals)) return "";
@@ -113,7 +113,7 @@ function hcTargetKind(target: string): string {
 
 function herdrNotify(target: string, text: string): string {
   try {
-    const p = spawnSync("herdr", ["agent", "prompt", target, text], { encoding: "utf8" });
+    const p = spawnSync("herdr", ["agent", "prompt", target, text], { encoding: "utf8", timeout: 8000 });
     if (p.status === 0) return `notified ${target}`;
     const err = (p.stderr as string).trim();
     if (err === "") return `notify to ${target} failed: exit ${p.status}`;
@@ -125,7 +125,7 @@ function herdrNotify(target: string, text: string): string {
 
 function hcNotify(target: string, text: string): string {
   try {
-    const p = spawnSync("hc", ["send", target, text], { encoding: "utf8" });
+    const p = spawnSync("hc", ["send", target, text], { encoding: "utf8", timeout: 8000 });
     if (p.status === 0) return `notified ${target} via hc send`;
     const err = (p.stderr as string).trim();
     if (err === "") return `notify to ${target} via hc send failed: exit ${p.status}`;
@@ -153,7 +153,7 @@ interface HcNoFooter {
  * null when hcx is absent, the call fails, or the line does not parse. */
 function hcxVersion(): { major: number; minor: number; patch: number } | null {
   try {
-    const p = spawnSync("hcx", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const p = spawnSync("hcx", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
     if (p.status !== 0) return null;
     const first = (p.stdout as string).split("\n")[0]?.trim() ?? "";
     const m = first.match(/^hcx\s+v?(\d+)\.(\d+)\.(\d+)/);
@@ -187,7 +187,7 @@ function hcxNoFooter(): HcNoFooter {
  * when hcxNoFooter() says the installed hcx supports the flag. */
 function hcxNotify(target: string, text: string): HcResult {
   try {
-    const p = spawnSync("hcx", ["send", "--no-footer", target, text], { encoding: "utf8" });
+    const p = spawnSync("hcx", ["send", "--no-footer", target, text], { encoding: "utf8", timeout: 8000 });
     if (p.status === 0) return { ok: true, detail: `notified ${target} via hcx send --no-footer`, reason: "" };
     const err = (p.stderr as string).trim();
     const reason = err === "" ? `exit ${p.status}` : err.split("\n")[0]!;

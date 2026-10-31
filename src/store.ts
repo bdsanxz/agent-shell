@@ -16,6 +16,17 @@ export interface Owner {
 
 export const DEFAULT_HEARTBEAT_MS = 120_000;
 
+/** The default heartbeat interval, injectable for tests via
+ * `AGENT_SHELL_DEFAULT_HEARTBEAT_MS` (milliseconds). */
+export function defaultHeartbeatMs(): number {
+  const raw = process.env.AGENT_SHELL_DEFAULT_HEARTBEAT_MS;
+  if (raw !== undefined && raw.trim() !== "") {
+    const n = Number(raw.trim());
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return DEFAULT_HEARTBEAT_MS;
+}
+
 export interface Meta {
   id: string;
   name: string;
@@ -28,6 +39,11 @@ export interface Meta {
   heartbeat_ms: number | null;
   child_pid: number | null;
   supervisor_pid: number | null;
+  /** `ps -o lstart` output for the child at spawn; null when unknown. Used to
+   * avoid signalling a reused PID. */
+  child_lstart?: string | null;
+  /** `ps -o lstart` output for the supervisor at start; null when unknown. */
+  supervisor_lstart?: string | null;
 }
 
 export interface Status {
@@ -41,6 +57,8 @@ export interface Status {
   heartbeats: number;
   last_heartbeat_ms: number | null;
   last_heartbeat_detail: string;
+  /** Start-up failure (missing executable, bad cwd, spawn error); null otherwise. */
+  error: string | null;
 }
 
 export function stateRoot(): string {
@@ -67,15 +85,22 @@ export function readMeta(dir: string): Meta | null {
     if (!raw || typeof (raw as Meta).id !== "string") return null;
     return {
       ...(raw as Meta),
-      heartbeat_ms: raw.heartbeat_ms ?? DEFAULT_HEARTBEAT_MS,
+      heartbeat_ms: raw.heartbeat_ms === undefined ? defaultHeartbeatMs() : raw.heartbeat_ms,
     };
   } catch {
     return null;
   }
 }
 
+/** Atomic write: temp file in the same directory, then rename. */
+function atomicWrite(file: string, text: string): void {
+  const tmp = `${file}.tmp.${process.pid}.${Math.floor(Math.random() * 1_000_000)}`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, file);
+}
+
 export function writeMeta(dir: string, meta: Meta): void {
-  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n");
+  atomicWrite(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n");
 }
 
 export function readStatus(dir: string): Status | null {
@@ -87,6 +112,7 @@ export function readStatus(dir: string): Status | null {
       heartbeats: raw.heartbeats ?? 0,
       last_heartbeat_ms: raw.last_heartbeat_ms ?? null,
       last_heartbeat_detail: raw.last_heartbeat_detail ?? "",
+      error: raw.error ?? null,
     };
   } catch {
     return null;
@@ -94,7 +120,7 @@ export function readStatus(dir: string): Status | null {
 }
 
 export function writeStatus(dir: string, status: Status): void {
-  fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(status, null, 2) + "\n");
+  atomicWrite(path.join(dir, "status.json"), JSON.stringify(status, null, 2) + "\n");
 }
 
 /** A short unique job id: `sh-<millis>-<pid>`, plus a suffix when taken. */

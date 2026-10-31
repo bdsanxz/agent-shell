@@ -1,12 +1,12 @@
 // One function per command, plus the help texts. `dispatch` routes them.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { UsageError, bool, parseArgs, str, unknownFlags } from "./args.ts";
 import { currentOwner, defaultTarget, notify } from "./notify.ts";
 import {
-  DEFAULT_HEARTBEAT_MS,
+  defaultHeartbeatMs,
   freshId,
   jobDir,
   jobsDir,
@@ -79,7 +79,8 @@ Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--hear
                      Default: 2m. Minimum: 1s. Use 0 or off to disable.
   --no-heartbeat     No progress notifies; only the completion notify is sent.
   --wait <d>         Wait up to <d> for the job to finish (e.g. 5s, 2m), print its
-                     output and exit status, then exit. Default: do not wait.
+                     output and exit status, then exit with the job's exit code
+                     (124 on timeout). Default: do not wait.
   <command...>       The command to run (after \`--\`); use \`sh -c '...'\` for shell features.
 
 Prints the job id and the notify target, then exits at once unless --wait is given.`,
@@ -103,23 +104,31 @@ Usage: agent-shell tail <id> [--lines <n>]
 
 Usage: agent-shell check <id>
 
-Prints one line per check with its concrete value, then a summary line:
+Prints one line per record check with its concrete value, then a summary
+line, then a success line (the job's own outcome, separate from the records):
 
   ok finished: state is done
   ok exit: 0
   ok output: 12 lines
   ok notify: notified w1:p1
   check sh-1234-5678: 4/4 pass
+  ok success: exit 0
 
-Exit 0 when all four pass, 1 when any fails, 2 when the job is
-unknown or still running. A killed job fails the finished check:
-its output is partial and it never got a completion notify.
+Exit 0 only when all four record checks pass and the job succeeded
+(state done, exit 0); 1 when any record check fails or the job did not
+succeed; 2 when the job is unknown or still running. A killed job fails
+the finished check: its output is partial and it never got a completion
+notify. A job with no notify target prints "ok notify: n/a" (not a failure).
 
 When progress notifies were sent, the last one prints as \`progress notify: ...\`
 after the notify line. It is informational and does not change the pass count.`,
   kill: `agent-shell kill — stop a running job (SIGTERM, then SIGKILL)
 
 Usage: agent-shell kill <id>
+
+Refuses with exit 2 unless the job state is running, leaving a finished
+job's result untouched. The child is only signalled when its process start
+time still matches the recorded start (no PID-reuse kill).
 
 A killed job gets no completion notify; its partial output stays readable.`,
   clean: `agent-shell clean — remove finished job directories
@@ -219,6 +228,14 @@ function cmdList(argv: string[]): number {
   return 0;
 }
 
+function parseCount(raw: string | undefined, def: number, flag: string): number {
+  if (raw === undefined) return def;
+  if (!/^\d+$/.test(raw.trim())) throw new UsageError(`bad --${flag} '${raw}': needs a positive integer`);
+  const n = parseInt(raw.trim(), 10);
+  if (!Number.isSafeInteger(n) || n < 1) throw new UsageError(`bad --${flag} '${raw}': needs a positive integer`);
+  return n;
+}
+
 function cmdShow(argv: string[]): number {
   const p = parseArgs(argv);
   unknownFlags(p, ["tail"]);
@@ -228,7 +245,7 @@ function cmdShow(argv: string[]): number {
   }
   const id = p.positionals[0];
   if (!id || p.positionals.length !== 1) throw new UsageError("show needs exactly one <id>");
-  const tail = Math.max(1, parseInt(str(p, "tail") ?? "30", 10) || 30);
+  const tail = parseCount(str(p, "tail"), 30, "tail");
   const dir = jobDir(stateRoot(), id);
   const meta = readMeta(dir);
   if (!meta) throw new UsageError(`unknown job ${id}`);
@@ -241,8 +258,9 @@ function cmdShow(argv: string[]): number {
   if (status?.exit_code !== null && status?.exit_code !== undefined) console.log(`exit ${status.exit_code}`);
   if (status?.duration_ms !== null && status?.duration_ms !== undefined)
     console.log(`duration_ms ${status.duration_ms}`);
+  if (status?.error) console.log(`error ${status.error}`);
   if (status?.notify_detail) console.log(`notify ${status.notify_detail}`);
-  const hb = meta.heartbeat_ms ?? DEFAULT_HEARTBEAT_MS;
+  const hb = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
   console.log(`heartbeat ${hb === null ? "off" : `${hb}ms`}`);
   if ((status?.heartbeats ?? 0) > 0) console.log(`heartbeats ${status!.heartbeats}`);
   if (status?.last_heartbeat_detail) console.log(`last_heartbeat ${status.last_heartbeat_detail}`);
@@ -261,7 +279,7 @@ function cmdTail(argv: string[]): number {
   }
   const id = p.positionals[0];
   if (!id || p.positionals.length !== 1) throw new UsageError("tail needs exactly one <id>");
-  const lines = Math.max(1, parseInt(str(p, "lines") ?? "50", 10) || 50);
+  const lines = parseCount(str(p, "lines"), 50, "lines");
   const dir = jobDir(stateRoot(), id);
   if (!readMeta(dir)) throw new UsageError(`unknown job ${id}`);
   const out = tailLog(dir, lines);
@@ -311,13 +329,59 @@ function cmdCheck(argv: string[]): number {
   line(lines !== null, lines !== null ? `output: ${lines.length} lines` : `output: output.log is missing or unreadable`);
   const notified = status?.notified === true;
   const detail = status?.notify_detail ?? "";
-  line(notified, notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`);
+  const noTarget = detail.includes("no notify target") || (meta.notify_target ?? "") === "";
+  if (noTarget) {
+    line(true, `notify: n/a (no notify target)`);
+  } else {
+    line(notified, notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`);
+  }
   // The last progress notify is informational: a failure here is visible, but only
   // the completion notify decides whether the job's result is trusted.
   const lastProgress = status?.last_heartbeat_detail ?? "";
   if (lastProgress !== "") console.log(`progress notify: ${lastProgress}`);
   console.log(`check ${id}: ${pass}/4 pass`);
-  return pass === 4 ? 0 : 1;
+  const success = state === "done" && code === 0;
+  if (success) {
+    console.log(`ok success: exit 0`);
+  } else if (code === null || code === undefined) {
+    console.log(`FAIL success: state is ${state} with no exit code`);
+  } else {
+    console.log(`FAIL success: exit ${code} (state is ${state})`);
+  }
+  return pass === 4 && success ? 0 : 1;
+}
+
+/** `ps -o lstart` for a pid, or null when the process is gone/unreadable. */
+function procStartTime(pid: number): string | null {
+  try {
+    const p = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 8000,
+    });
+    if (p.status !== 0) return null;
+    const s = (p.stdout as string).trim();
+    return s === "" ? null : s;
+  } catch {
+    return null;
+  }
+}
+
+/** True when pid is alive AND still the same process we started (when we know
+ * the start time). A stored null means "unknown": fall back to a liveness check. */
+function pidMatches(pid: number, stored: string | null | undefined): boolean {
+  let alive = false;
+  try {
+    process.kill(pid, 0);
+    alive = true;
+  } catch {
+    return false;
+  }
+  if (!alive) return false;
+  if (stored === null || stored === undefined) return true;
+  const cur = procStartTime(pid);
+  if (cur === null) return false;
+  return cur === stored;
 }
 
 function cmdKill(argv: string[]): number {
@@ -332,11 +396,19 @@ function cmdKill(argv: string[]): number {
   const dir = jobDir(stateRoot(), id);
   const meta = readMeta(dir);
   if (!meta) throw new UsageError(`unknown job ${id}`);
+  const status = readStatus(dir);
+  const state = status?.state ?? "running";
+  if (state !== "running") throw new UsageError(`job ${id} is not running (state is ${state}); refusing to kill a finished job`);
   let killed = false;
-  for (const pid of [meta.child_pid, meta.supervisor_pid]) {
-    if (pid === null || pid === undefined) continue;
+  const targets: Array<{ pid: number | null | undefined; stored: string | null | undefined }> = [
+    { pid: meta.child_pid, stored: meta.child_lstart },
+    { pid: meta.supervisor_pid, stored: meta.supervisor_lstart },
+  ];
+  for (const t of targets) {
+    if (t.pid === null || t.pid === undefined) continue;
+    if (!pidMatches(t.pid, t.stored)) continue;
     try {
-      process.kill(pid, "SIGTERM");
+      process.kill(t.pid, "SIGTERM");
       killed = true;
     } catch {
       // already gone
@@ -345,10 +417,11 @@ function cmdKill(argv: string[]): number {
   const t0 = Date.now();
   while (Date.now() - t0 < 500) {
     if (
-      [meta.child_pid, meta.supervisor_pid].every((pid) => {
-        if (pid === null || pid === undefined) return true;
+      targets.every((t) => {
+        if (t.pid === null || t.pid === undefined) return true;
+        if (!pidMatches(t.pid, t.stored)) return true;
         try {
-          process.kill(pid, 0);
+          process.kill(t.pid, 0);
           return false;
         } catch {
           return true;
@@ -358,12 +431,13 @@ function cmdKill(argv: string[]): number {
       break;
     Bun.sleepSync(50);
   }
-  for (const pid of [meta.child_pid, meta.supervisor_pid]) {
-    if (pid === null || pid === undefined) continue;
+  for (const t of targets) {
+    if (t.pid === null || t.pid === undefined) continue;
+    if (!pidMatches(t.pid, t.stored)) continue;
     try {
-      process.kill(pid, 0);
+      process.kill(t.pid, 0);
       try {
-        process.kill(pid, "SIGKILL");
+        process.kill(t.pid, "SIGKILL");
       } catch {
         // gone
       }
@@ -383,6 +457,7 @@ function cmdKill(argv: string[]): number {
     heartbeats: prev?.heartbeats ?? 0,
     last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
     last_heartbeat_detail: prev?.last_heartbeat_detail ?? "",
+    error: prev?.error ?? null,
   });
   console.log(`killed ${id}`);
   return 0;
@@ -425,7 +500,7 @@ function parseDurationMs(s: string): number {
 /** Parse the --heartbeat value. Returns null when heartbeats are disabled. */
 function parseHeartbeatMs(raw: string | undefined, disabled: boolean): number | null {
   if (disabled) return null;
-  if (raw === undefined) return DEFAULT_HEARTBEAT_MS;
+  if (raw === undefined) return defaultHeartbeatMs();
   const v = raw.trim().toLowerCase();
   if (v === "" || v === "off" || v === "no" || v === "none" || v === "never" || v === "disabled") return null;
   const ms = parseDurationMs(raw.trim());
@@ -458,6 +533,36 @@ function sanitizeName(name: string): string {
   return out === "" ? "job" : out;
 }
 
+function resolveExecutable(cmd: string): string | null {
+  try {
+    const w = (Bun as unknown as { which?: (c: string) => string | null }).which;
+    if (typeof w === "function") return w.call(Bun, cmd);
+  } catch {
+    // fall through to PATH search
+  }
+  if (cmd.includes("/")) {
+    try {
+      fs.accessSync(cmd, fs.constants.X_OK);
+      return cmd;
+    } catch {
+      return null;
+    }
+  }
+  const pathEnv = process.env.PATH ?? "";
+  for (const d of pathEnv.split(":")) {
+    if (d === "") continue;
+    const full = path.join(d, cmd);
+    try {
+      fs.accessSync(full, fs.constants.X_OK);
+      const st = fs.statSync(full);
+      if (st.isFile()) return full;
+    } catch {
+      // next
+    }
+  }
+  return null;
+}
+
 async function cmdRun(argv: string[]): Promise<number> {
   const p = parseArgs(argv, ["no-heartbeat"]);
   unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat", "wait"]);
@@ -469,11 +574,20 @@ async function cmdRun(argv: string[]): Promise<number> {
   const heartbeatMs = parseHeartbeatMs(str(p, "heartbeat"), bool(p, "no-heartbeat"));
   const waitRaw = str(p, "wait");
   const waitMs = waitRaw === undefined ? undefined : parseDurationMs(waitRaw.trim());
+  const cwd = str(p, "cwd") ?? process.cwd();
+  try {
+    const st = fs.statSync(cwd);
+    if (!st.isDirectory()) throw new UsageError(`bad --cwd '${cwd}': not a directory`);
+  } catch (e) {
+    if (e instanceof UsageError) throw e;
+    throw new UsageError(`bad --cwd '${cwd}': no such directory`);
+  }
+  const exe = p.positionals[0]!;
+  if (resolveExecutable(exe) === null) throw new UsageError(`cannot start '${exe}': executable not found on PATH`);
   const root = stateRoot();
   const id = freshId(root);
   const dir = jobDir(root, id);
   fs.mkdirSync(dir, { recursive: true });
-  const cwd = str(p, "cwd") ?? process.cwd();
   const owner = currentOwner();
   const target = defaultTarget(str(p, "notify"), owner);
   const meta: Meta = {
@@ -487,6 +601,8 @@ async function cmdRun(argv: string[]): Promise<number> {
     heartbeat_ms: heartbeatMs,
     child_pid: null,
     supervisor_pid: null,
+    child_lstart: null,
+    supervisor_lstart: null,
   };
   writeMeta(dir, meta);
   writeStatus(dir, {
@@ -499,6 +615,7 @@ async function cmdRun(argv: string[]): Promise<number> {
     heartbeats: 0,
     last_heartbeat_ms: null,
     last_heartbeat_detail: "",
+    error: null,
   });
   fs.writeFileSync(path.join(dir, "output.log"), "");
   spawnSupervisor(id);
@@ -519,12 +636,14 @@ async function cmdRun(argv: string[]): Promise<number> {
   }
   if ((status?.state ?? "running") === "running") {
     console.log(`still running after ${formatElapsed(waitMs)}; read with: agent-shell show ${id}`);
-    return 0;
+    return 124;
   }
   const out = tailLog(dir, 30);
   if (out.trim() !== "") console.log(`--- output (last 30 lines) ---\n${out}`);
   console.log(`exit ${status?.exit_code ?? "?"}`);
-  return 0;
+  const code = status?.exit_code;
+  if (typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255) return code;
+  return 1;
 }
 
 /** Detach `supervise <id>`: stdio ignored, new session, no wait. */
@@ -556,9 +675,10 @@ async function supervise(id: string): Promise<number> {
   const meta = readMeta(dir);
   if (!meta) throw new Error(`unknown job ${id}`);
   meta.supervisor_pid = process.pid;
+  meta.supervisor_lstart = procStartTime(process.pid);
   writeMeta(dir, meta);
   const started = nowMs();
-  const heartbeatMs = meta.heartbeat_ms ?? DEFAULT_HEARTBEAT_MS;
+  const heartbeatMs = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
   const logPath = path.join(dir, "output.log");
   const logFd = fs.openSync(logPath, "a");
   let proc: ReturnType<typeof Bun.spawn>;
@@ -572,20 +692,40 @@ async function supervise(id: string): Promise<number> {
   } catch (e) {
     fs.closeSync(logFd);
     const msg = e instanceof Error ? e.message : String(e);
+    const startError = `could not start '${meta.command.join(" ")}': ${msg}`;
+    const failedAt = nowMs();
     writeStatus(dir, {
       state: "failed",
       exit_code: -1,
-      done_ms: nowMs(),
-      duration_ms: nowMs() - started,
+      done_ms: failedAt,
+      duration_ms: failedAt - started,
       notified: false,
-      notify_detail: `could not start '${meta.command.join(" ")}': ${msg}`,
+      notify_detail: "pending: completion notify not sent yet",
       heartbeats: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
+      error: startError,
     });
-    return 1;
+    const text = `shell job '${meta.name}' failed to start: ${msg}. Read with: agent-shell show ${meta.id}`;
+    const detail = notify(meta.notify_target, text);
+    const cur = readStatus(dir);
+    if (cur && cur.state === "killed") return 0;
+    writeStatus(dir, {
+      state: "failed",
+      exit_code: -1,
+      done_ms: failedAt,
+      duration_ms: failedAt - started,
+      notified: detail.startsWith("notified"),
+      notify_detail: detail,
+      heartbeats: 0,
+      last_heartbeat_ms: null,
+      last_heartbeat_detail: "",
+      error: startError,
+    });
+    return 0;
   }
   meta.child_pid = proc.pid;
+  meta.child_lstart = procStartTime(proc.pid);
   writeMeta(dir, meta);
 
   let heartbeats = 0;
@@ -607,6 +747,7 @@ async function supervise(id: string): Promise<number> {
   // Skipped entirely when disabled or when there is no notify target.
   // The wait races the heartbeat interval against process exit, so a job
   // shorter than the interval finishes at once with no progress notify.
+  // An unreadable status (null) is not "not running": keep supervising.
   if (heartbeatMs !== null && meta.notify_target !== "") {
     const done = proc.exited.then(
       () => {},
@@ -617,7 +758,7 @@ async function supervise(id: string): Promise<number> {
       if (finished) break;
       if ((proc.exitCode ?? null) !== null) break;
       const cur = readStatus(dir);
-      if (!cur || cur.state !== "running") return 0;
+      if (cur && cur.state !== "running") return 0;
       const elapsed = nowMs() - started;
       const last = lastOutputLine(dir);
       const hbText =
@@ -638,6 +779,7 @@ async function supervise(id: string): Promise<number> {
         heartbeats,
         last_heartbeat_ms: lastHeartbeatMs,
         last_heartbeat_detail: lastHeartbeatDetail,
+        error: null,
       });
       if (finished) break;
     }
@@ -649,13 +791,30 @@ async function supervise(id: string): Promise<number> {
   const cur = readStatus(dir);
   if (cur && cur.state === "killed") return 0;
   const done = nowMs();
+  // Record the final state BEFORE notifying, so a receiver that wakes early
+  // never sees "still running". The notify result is filled in afterwards.
+  const finalState = code === 0 ? "done" : "failed";
+  writeStatus(dir, {
+    state: finalState,
+    exit_code: code,
+    done_ms: done,
+    duration_ms: done - started,
+    notified: false,
+    notify_detail: "pending: completion notify not sent yet",
+    heartbeats,
+    last_heartbeat_ms: lastHeartbeatMs,
+    last_heartbeat_detail: lastHeartbeatDetail,
+    error: null,
+  });
   const lastLine = lastOutputLine(dir);
   const secs = ((done - started) / 1000).toFixed(1);
   let text = `shell job '${meta.name}' done (exit ${code}, ${secs}s). Read with: agent-shell show ${meta.id}`;
   if (lastLine !== "") text += ` Last line: ${lastLine.slice(0, 160)}`;
   const detail = notify(meta.notify_target, text);
+  const raced = readStatus(dir);
+  if (raced && raced.state === "killed") return 0;
   writeStatus(dir, {
-    state: code === 0 ? "done" : "failed",
+    state: finalState,
     exit_code: code,
     done_ms: done,
     duration_ms: done - started,
@@ -664,6 +823,7 @@ async function supervise(id: string): Promise<number> {
     heartbeats,
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
+    error: null,
   });
   return 0;
 }

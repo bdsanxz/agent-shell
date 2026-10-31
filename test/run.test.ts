@@ -28,7 +28,17 @@ function waitFor(home: string, id: string, want: string[], timeoutMs = 15000): s
   const t0 = Date.now();
   for (;;) {
     const text = fs.existsSync(statusPath) ? fs.readFileSync(statusPath, "utf8") : "";
-    if (want.some((w) => text.includes(w))) return text;
+    if (want.some((w) => text.includes(w))) {
+      // The supervisor records done/failed BEFORE notifying, then fills in
+      // the notify result. Wait until the pending marker is gone so `check`
+      // sees the final notify_detail.
+      if (text.includes("pending: completion notify")) {
+        if (Date.now() - t0 > timeoutMs) throw new Error(`job ${id} stuck pending: ${text}`);
+        Bun.sleepSync(200);
+        continue;
+      }
+      return text;
+    }
     if (Date.now() - t0 > timeoutMs) throw new Error(`job ${id} never finished: ${text}`);
     Bun.sleepSync(200);
   }
@@ -217,7 +227,8 @@ describe("check", () => {
     expect(c.code).toBe(1);
     expect(c.out).toContain("ok finished: state is failed");
     expect(c.out).toContain("ok exit: 3");
-    expect(c.out).toContain("FAIL notify: not delivered (skipped: no notify target");
+    expect(c.out).toContain("ok notify: n/a (no notify target)");
+    expect(c.out).toContain("FAIL success: exit 3");
   });
 
   function failingHerdrWithHcBin(hcLog: string): string {
@@ -596,5 +607,285 @@ describe("notify route", () => {
     expect(c.code).toBe(0);
     expect(c.out).toContain("progress notify: notified w9:p9");
     expect(readLog(path.join(logDir, "herdr.log"))).toContain("still running");
+  });
+});
+
+describe("0.2.4 fixes", () => {
+  function loggingHerdrBin(logFile: string, delayMs = 0): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-herdr-"));
+    const delay = delayMs > 0 ? `sleep ${(delayMs / 1000).toString()}\n` : "";
+    fs.writeFileSync(path.join(dir, "herdr"), `#!/bin/sh\n${delay}printf '%s\\n' "$*" >> "${logFile}"\nexit 0\n`);
+    fs.chmodSync(path.join(dir, "herdr"), 0o755);
+    return dir;
+  }
+
+  test("--no-heartbeat stays off even with a short default", () => {
+    const home = freshHome();
+    const logFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hb-")), "herdr.log");
+    const bin = loggingHerdrBin(logFile);
+    const env = {
+      HERDR_PANE_ID: "w9:p9",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      AGENT_SHELL_DEFAULT_HEARTBEAT_MS: "1000",
+    };
+    const r = cli(home, ["run", "--no-heartbeat", "--", "sh", "-c", "sleep 3"], env);
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    expect(r.out).toContain("heartbeat off");
+    expect(JSON.parse(fs.readFileSync(path.join(home, "jobs", id, "meta.json"), "utf8")).heartbeat_ms).toBeNull();
+    expect(cli(home, ["show", id], env).out).toContain("heartbeat off");
+    waitFor(home, id, ['"done"'], 20000);
+    let log = "";
+    try {
+      log = fs.readFileSync(logFile, "utf8");
+    } catch {
+      log = "";
+    }
+    expect(log).not.toContain("still running");
+    expect(log).toContain("done (exit 0");
+    expect(JSON.parse(fs.readFileSync(path.join(home, "jobs", id, "status.json"), "utf8")).heartbeats).toBe(0);
+  });
+
+  test("--heartbeat 0 and off disable heartbeats in meta", () => {
+    const home = freshHome();
+    for (const v of ["0", "off"]) {
+      const r = cli(home, ["run", "--heartbeat", v, "--", "sh", "-c", "sleep 30"]);
+      expect(r.code).toBe(0);
+      const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+      expect(JSON.parse(fs.readFileSync(path.join(home, "jobs", id, "meta.json"), "utf8")).heartbeat_ms).toBeNull();
+      expect(cli(home, ["show", id]).out).toContain("heartbeat off");
+      expect(cli(home, ["kill", id]).code).toBe(0);
+    }
+  });
+
+  test("kill refuses on finished jobs and leaves the result untouched", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--", "sh", "-c", "exit 0"]);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    const before = fs.readFileSync(path.join(home, "jobs", id, "status.json"), "utf8");
+    const k = cli(home, ["kill", id]);
+    expect(k.code).toBe(2);
+    expect(k.err).toContain("not running");
+    expect(fs.readFileSync(path.join(home, "jobs", id, "status.json"), "utf8")).toBe(before);
+    const k2 = cli(home, ["kill", "sh-nope"]);
+    expect(k2.code).toBe(2);
+  });
+
+  test("kill does not signal a PID that was reused", () => {
+    const home = freshHome();
+    const sleeper = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+    const otherPid = sleeper.pid;
+    try {
+      const dir = path.join(home, "jobs", "sh-9999-reuse");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "meta.json"),
+        JSON.stringify({
+          id: "sh-9999-reuse",
+          name: "reuse",
+          command: ["sh", "-c", "sleep 30"],
+          cwd: process.cwd(),
+          created_ms: Date.now(),
+          owner: { pane_id: "", agent_name: "", workspace_id: "" },
+          notify_target: "",
+          heartbeat_ms: null,
+          child_pid: otherPid,
+          supervisor_pid: null,
+          child_lstart: "bogus mismatch for test",
+          supervisor_lstart: null,
+        }) + "\n",
+      );
+      fs.writeFileSync(
+        path.join(dir, "status.json"),
+        JSON.stringify({
+          state: "running",
+          exit_code: null,
+          done_ms: null,
+          duration_ms: null,
+          notified: false,
+          notify_detail: "",
+          heartbeats: 0,
+          last_heartbeat_ms: null,
+          last_heartbeat_detail: "",
+          error: null,
+        }) + "\n",
+      );
+      const k = cli(home, ["kill", "sh-9999-reuse"]);
+      expect(k.code).toBe(0);
+      let alive = true;
+      try {
+        process.kill(otherPid, 0);
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).state).toBe("killed");
+    } finally {
+      try {
+        sleeper.kill();
+      } catch {
+        // gone
+      }
+    }
+  });
+
+  test("run validates --cwd and the executable up front", () => {
+    const home = freshHome();
+    const badCwd = cli(home, ["run", "--cwd", "/no-such-dir-xyz-123", "--", "sh", "-c", "true"]);
+    expect(badCwd.code).toBe(2);
+    expect(badCwd.err).toContain("bad --cwd");
+    const badExe = cli(home, ["run", "--", "no-such-exe-xyz-123"]);
+    expect(badExe.code).toBe(2);
+    expect(badExe.err).toContain("executable not found");
+    const jobsDir = path.join(home, "jobs");
+    const entries = fs.existsSync(jobsDir) ? fs.readdirSync(jobsDir) : [];
+    expect(entries).toHaveLength(0);
+  });
+
+  test("a start failure sends the completion notify and records the error", () => {
+    const home = freshHome();
+    const logFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hb-")), "herdr.log");
+    const bin = loggingHerdrBin(logFile);
+    const dir = path.join(home, "jobs", "sh-9999-badstart");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "meta.json"),
+      JSON.stringify({
+        id: "sh-9999-badstart",
+        name: "badstart",
+        command: ["sh", "-c", "true"],
+        cwd: "/no-such-dir-xyz-123",
+        created_ms: Date.now(),
+        owner: { pane_id: "w9:p9", agent_name: "", workspace_id: "" },
+        notify_target: "w9:p9",
+        heartbeat_ms: null,
+        child_pid: null,
+        supervisor_pid: null,
+        child_lstart: null,
+        supervisor_lstart: null,
+      }) + "\n",
+    );
+    fs.writeFileSync(
+      path.join(dir, "status.json"),
+      JSON.stringify({
+        state: "running",
+        exit_code: null,
+        done_ms: null,
+        duration_ms: null,
+        notified: false,
+        notify_detail: "",
+        heartbeats: 0,
+        last_heartbeat_ms: null,
+        last_heartbeat_detail: "",
+        error: null,
+      }) + "\n",
+    );
+    fs.writeFileSync(path.join(dir, "output.log"), "");
+    const r = cli(home, ["supervise", "sh-9999-badstart"], {
+      HERDR_PANE_ID: "w9:p9",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    });
+    expect(r.code).toBe(0);
+    const status = JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8"));
+    expect(status.state).toBe("failed");
+    expect(status.error).toContain("could not start");
+    expect(status.notify_detail).toContain("notified w9:p9");
+    expect(fs.readFileSync(logFile, "utf8")).toContain("failed to start");
+  });
+
+  test("done is recorded before the completion notify", () => {
+    const home = freshHome();
+    const logFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hb-")), "herdr.log");
+    const bin = loggingHerdrBin(logFile, 2000);
+    const r = cli(home, ["run", "--no-heartbeat", "--", "sh", "-c", "exit 0"], {
+      HERDR_PANE_ID: "w9:p9",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    });
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    Bun.sleepSync(800);
+    const mid = fs.readFileSync(path.join(home, "jobs", id, "status.json"), "utf8");
+    expect(mid).toContain('"done"');
+    expect(mid).not.toContain('"running"');
+    waitFor(home, id, ['"done"'], 20000);
+    const fin = JSON.parse(fs.readFileSync(path.join(home, "jobs", id, "status.json"), "utf8"));
+    expect(fin.notified).toBe(true);
+  });
+
+  test("check fails a failed job even when its records pass", () => {
+    const home = freshHome();
+    const bin = loggingHerdrBin(path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hb-")), "herdr.log"));
+    const r = cli(home, ["run", "--", "sh", "-c", "exit 3"], {
+      HERDR_PANE_ID: "w9:p9",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    });
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"failed"']);
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(1);
+    expect(c.out).toContain("check " + id + ": 4/4 pass");
+    expect(c.out).toContain("FAIL success: exit 3");
+  });
+
+  test("run --wait returns the job exit code and 124 on timeout", () => {
+    const home = freshHome();
+    const ok = cli(home, ["run", "--wait", "5s", "--", "sh", "-c", "exit 0"]);
+    expect(ok.code).toBe(0);
+    expect(ok.out).toContain("exit 0");
+    const bad = cli(home, ["run", "--wait", "5s", "--", "sh", "-c", "exit 3"]);
+    expect(bad.code).toBe(3);
+    expect(bad.out).toContain("exit 3");
+    const slow = cli(home, ["run", "--wait", "1s", "--", "sh", "-c", "sleep 5"]);
+    expect(slow.code).toBe(124);
+    expect(slow.out).toContain("still running");
+    const id = slow.out.split("\n")[0]!.replace("job ", "").trim();
+    expect(cli(home, ["kill", id]).code).toBe(0);
+  });
+
+  test("check reports n/a for a job with no notify target", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--", "sh", "-c", "exit 0"]);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    const c = cli(home, ["check", id]);
+    expect(c.code).toBe(0);
+    expect(c.out).toContain("ok notify: n/a (no notify target)");
+    expect(c.out).toContain("ok success: exit 0");
+  });
+
+  test("supervisor keeps the child when the status is unreadable", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--heartbeat", "1s", "--", "sh", "-c", "sleep 3; echo done"]);
+    expect(r.code).toBe(0);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    Bun.sleepSync(1500);
+    fs.rmSync(path.join(home, "jobs", id, "status.json"), { force: true });
+    waitFor(home, id, ['"done"'], 20000);
+    const show = cli(home, ["show", id]);
+    expect(show.code).toBe(0);
+    expect(show.out).toContain("done");
+    expect(cli(home, ["clean"]).out).toContain("removed 1");
+  });
+
+  test("writes leave no temp files behind", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--", "sh", "-c", "exit 0"]);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    const dir = path.join(home, "jobs", id);
+    const leftovers = fs.readdirSync(dir).filter((f) => f.includes(".tmp."));
+    expect(leftovers).toHaveLength(0);
+  });
+
+  test("--tail abc and --lines abc exit 2", () => {
+    const home = freshHome();
+    const r = cli(home, ["run", "--", "sh", "-c", "echo hi"]);
+    const id = r.out.split("\n")[0]!.replace("job ", "").trim();
+    waitFor(home, id, ['"done"']);
+    expect(cli(home, ["show", id, "--tail", "abc"]).code).toBe(2);
+    expect(cli(home, ["show", id, "--tail", "abc"]).err).toContain("needs a positive integer");
+    expect(cli(home, ["tail", id, "--lines", "abc"]).code).toBe(2);
+    expect(cli(home, ["tail", id, "--lines", "1.5"]).code).toBe(2);
   });
 });
