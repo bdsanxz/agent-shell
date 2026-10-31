@@ -49,6 +49,9 @@ export interface Meta {
   cwd: string;
   created_ms: number;
   owner: Owner;
+  /** Caller-scoped owner: AGENT_SHELL_OWNER else HC_TERMINAL_ID else
+   * HERDR_PANE_ID else null. Absent (undefined) means a pre-0.6.0 job. */
+  owner_id?: string | null;
   notify_target: string;
   /** Interval between progress notifies while running; null disables them. */
   heartbeat_ms: number | null;
@@ -72,14 +75,19 @@ export interface Status {
   duration_ms: number | null;
   notified: boolean;
   notify_detail: string;
-  /** Typed notify outcome: delivered | not_started | unconfirmed | plain_shell | failed ("" when no notify was attempted). */
+  /** Typed notify outcome: delivered | not_started | unconfirmed | plain_shell | failed | skipped_busy ("" when no notify was attempted). */
   notify_outcome: string;
   /** Machine fields from `hcx send --json` when the send ran; null otherwise. */
   notify_route: string | null;
   notify_agent: string | null;
   notify_note: string | null;
-  /** Progress notifies sent while the job was running. */
+  /** Progress notifies sent while the job was running (alias of heartbeats_sent). */
   heartbeats: number;
+  /** Breakdown of heartbeat attempts: sent, skipped for back-off, skipped for busy target, failed. */
+  heartbeats_sent?: number;
+  heartbeats_skipped_backoff?: number;
+  heartbeats_skipped_busy?: number;
+  heartbeats_failed?: number;
   last_heartbeat_ms: number | null;
   last_heartbeat_detail: string;
   /** Start-up failure (missing executable, bad cwd, spawn error); null otherwise. */
@@ -142,9 +150,14 @@ export function readStatus(dir: string): Status | null {
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")) as Partial<Status>;
     if (!raw || typeof (raw as Status).state !== "string") return null;
+    const sent = raw.heartbeats_sent ?? raw.heartbeats ?? 0;
     return {
       ...(raw as Status),
-      heartbeats: raw.heartbeats ?? 0,
+      heartbeats: raw.heartbeats ?? sent,
+      heartbeats_sent: sent,
+      heartbeats_skipped_backoff: raw.heartbeats_skipped_backoff ?? 0,
+      heartbeats_skipped_busy: raw.heartbeats_skipped_busy ?? 0,
+      heartbeats_failed: raw.heartbeats_failed ?? 0,
       last_heartbeat_ms: raw.last_heartbeat_ms ?? null,
       last_heartbeat_detail: raw.last_heartbeat_detail ?? "",
       error: raw.error ?? null,
@@ -157,6 +170,36 @@ export function readStatus(dir: string): Status | null {
   } catch {
     return null;
   }
+}
+
+/** Caller identity for job ownership: AGENT_SHELL_OWNER else HC_TERMINAL_ID
+ * else HERDR_PANE_ID else null. Empty strings count as unset. */
+export function callerOwner(): string | null {
+  const override = (process.env.AGENT_SHELL_OWNER ?? "").trim();
+  if (override !== "") return override;
+  const hc = (process.env.HC_TERMINAL_ID ?? "").trim();
+  if (hc !== "") return hc;
+  const pane = (process.env.HERDR_PANE_ID ?? "").trim();
+  if (pane !== "") return pane;
+  return null;
+}
+
+/** True when a stored job belongs to the current caller. Legacy jobs (no
+ * owner_id key) belong to nobody: only --all shows them. */
+export function isOwnJob(meta: Meta, caller: string | null): boolean {
+  if (!("owner_id" in meta) || (meta as unknown as Record<string, unknown>)["owner_id"] === undefined) return false;
+  return (meta.owner_id ?? null) === caller;
+}
+
+/** POSIX shell quoting: single-quote any argument with characters outside
+ * [A-Za-z0-9_@%+=:,./-] (or empty), escaping embedded single quotes. */
+export function shellQuote(argv: string[]): string {
+  return argv
+    .map((a) => {
+      if (a !== "" && /^[A-Za-z0-9_@%+=:,./-]+$/.test(a)) return a;
+      return `'${a.replace(/'/g, `'\\''`)}'`;
+    })
+    .join(" ");
 }
 
 export function writeStatus(dir: string, status: Status): void {

@@ -6,9 +6,11 @@ import path from "node:path";
 import { UsageError, bool, parseArgs, str, unknownFlags, type Parsed } from "./args.ts";
 import { checkNotifyTarget, currentOwner, defaultTarget, notify, type NotifyResult } from "./notify.ts";
 import {
+  callerOwner,
   defaultHeartbeatMs,
   freshId,
   heartbeatMaxMs,
+  isOwnJob,
   jobDir,
   jobsDir,
   nowMs,
@@ -16,6 +18,7 @@ import {
   readStatus,
   readTailDetailed,
   sanitiseOutput,
+  shellQuote,
   stateRoot,
   writeMeta,
   writeStatus,
@@ -50,16 +53,22 @@ How it works:
   3. When it finishes, your session gets one completion notify turn:
      shell job 'build' done (exit 0). Read with: agent-shell show <id>
   4. Read it with \`agent-shell show <id>\` or \`agent-shell tail <id>\`.
-     Nobody polls: notify turns are the only wake-up.
+     Nobody polls: notify turns are the only wake-up. Jobs are owned
+     ($AGENT_SHELL_OWNER else $HC_TERMINAL_ID else $HERDR_PANE_ID else
+     ownerless); list/clean default to your own jobs (--all for every job).
   Notify turns go over the old herdr server (\`herdr agent prompt\`) when it runs,
   else herdr-core via \`hcx send --agent-only --no-footer --json\` (needs
   hcx 0.3.0 or newer; hcx refuses a plain shell or unknown kind before sending).
+  Heartbeats read the target via hcx ls --json and skip working/blocked
+  (busy skips are not failures); completion sends unconditionally.
+  The herdr route is skipped silently when no old server runs.
 
 Environment:
   AGENT_SHELL_HOME   state root instead of ~/.local/cache/agent-shell
   XDG_CACHE_HOME     cache root holding agent-shell/ when AGENT_SHELL_HOME is unset
   AGENT_SHELL_HEARTBEAT_MAX_MS   heartbeat back-off cap in ms (default 1800000)
   AGENT_SHELL_DEFAULT_HEARTBEAT_MS   default heartbeat in ms (tests only)
+  AGENT_SHELL_OWNER   owner override instead of $HC_TERMINAL_ID / $HERDR_PANE_ID (tests, scripts)
 
 Exit codes:
   0  success
@@ -94,19 +103,26 @@ Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--hear
                      It starts as the leader of its own process group (pgid in meta).
 
 Prints the job id and the notify target, then exits at once unless --wait is given.
-Job directories are 0700 and files 0600.
+Job directories are 0700 and files 0600. The job is owned by
+$AGENT_SHELL_OWNER else $HC_TERMINAL_ID else $HERDR_PANE_ID else ownerless;
+list/clean default to your own jobs (--all for every job).
 
 With --json, stdout is one JSON object (no table, no prose):
 {"id","name","command","command_string","cwd","created_ms","created_at",
 "notify_target","notify_warning","heartbeat_ms","heartbeat_fixed",
 "heartbeat_current_ms","read_hint","wait"}
 "wait" is null without --wait, else {"wait_ms","timed_out","state",
-"exit_code","output"}.`,
+"exit_code","output"}. command_string is POSIX shell-quoted.
+Heartbeats read the target via hcx ls --json and skip working/blocked;
+completion sends unconditionally (30s timeout, heartbeat 10s).`,
   list: `agent-shell list — list jobs (running first, then newest done)
 
 Usage: agent-shell list [--all] [--json]
 
-  --all    Include all finished jobs (default: running plus the 20 newest).
+  --all    Every job on the machine, with an OWNER column / owner field.
+           Default: only your own jobs (same owner: $AGENT_SHELL_OWNER else
+           $HC_TERMINAL_ID else $HERDR_PANE_ID else ownerless; pre-0.6.0 jobs
+           have no owner and need --all). Without --all at most 20 are shown.
   --json   Machine-readable JSON lines instead of the table (one object per line).
 
 States are running, done, failed, killed and lost (lost: the supervisor died
@@ -114,7 +130,8 @@ without writing a final status; its partial output stays readable).
 
 With --json, stdout is JSON lines (this command keeps that shape, as documented):
 {"id","name","state","exit","exit_code","cmd","command","heartbeats",
-"created_ms","created_at","done_ms","done_at","duration_ms"}.`,
+"created_ms","created_at","done_ms","done_at","duration_ms"}
+(list --all adds "owner").`,
   show: `agent-shell show — show one job: status plus the tail of its output
 
 Usage: agent-shell show <id> [--tail <n>] [--json]
@@ -130,8 +147,12 @@ With --json, stdout is one JSON object (no prose):
 "state","exit_code","duration_ms","done_ms","done_at","error",
 "notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
 "heartbeat_ms","heartbeat_fixed","heartbeat_current_ms","heartbeats",
-"last_heartbeat_ms","last_heartbeat_at","last_heartbeat_detail",
-"tail_lines_requested","output","lines","line_count","truncated","pgid"}.`,
+"heartbeats_sent","heartbeats_skipped_backoff","heartbeats_skipped_busy",
+"heartbeats_failed","last_heartbeat_ms","last_heartbeat_at",
+"last_heartbeat_detail","tail_lines_requested","output","lines","line_count",
+"truncated","pgid"}.
+command_string is POSIX shell-quoted (copy-paste reruns the same command).
+Heartbeats print as: heartbeats sent S, skipped K (backoff B, busy U), failed F.`,
   tail: `agent-shell tail — print the tail of one job's output
 
 Usage: agent-shell tail <id> [--lines <n>] [--json]
@@ -171,7 +192,13 @@ after the notify line. It is informational and does not change the pass count.
 With --json, stdout is one JSON object (no prose) with the same exit codes:
 {"id","state","exit_code","output_lines","output_ok","output_detail",
 "notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
-"notify_ok","progress_notify","checks","pass","total","success","success_detail"}.`,
+"notify_ok","progress_notify","heartbeats","heartbeats_sent",
+"heartbeats_skipped_backoff","heartbeats_skipped_busy","heartbeats_failed",
+"checks","pass","total","success","success_detail"}.
+The notify line is ok only for delivered or unconfirmed; unconfirmed prints
+as "ok notify: unconfirmed (delivery not verified)". A timed-out completion
+(exit null / kind timeout) is unconfirmed, not failed (completion 30s,
+heartbeat 10s timeouts).`,
   kill: `agent-shell kill — stop a running job (process group SIGTERM, then SIGKILL)
 
 Usage: agent-shell kill <id> [--json]
@@ -191,13 +218,15 @@ With --json, stdout is one JSON object (no prose):
 {"id","state","signalled","detail","done_ms","done_at"}.`,
   clean: `agent-shell clean — remove finished and lost job directories
 
-Usage: agent-shell clean [--older-than <duration>] [--json]
+Usage: agent-shell clean [--older-than <duration>] [--all] [--json]
 
   --older-than <d>   Only remove jobs finished this long ago or more (e.g. 24h, 7d).
                      Default: remove all finished and lost jobs. Running jobs are never removed.
+  --all              Every job on the machine. Default: only your own jobs
+                     (same owner; pre-0.6.0 jobs need --all).
 
 With --json, stdout is one JSON object (no prose):
-{"removed","removed_ids"}.`,
+{"removed","removed_ids","skipped_other_owner"}.`,
   supervise: `agent-shell supervise — internal: supervise one job to completion, then notify
 
 Usage: agent-shell supervise <id>
@@ -325,24 +354,31 @@ function cmdList(argv: string[]): number {
     throw new UsageError("list takes no arguments", "usage", "run agent-shell list --help for usage");
   const root = stateRoot();
   let jobs = allJobs(root);
-  if (!bool(p, "all") && jobs.length > 20) jobs = jobs.slice(0, 20);
+  const showAll = bool(p, "all");
+  if (!showAll) {
+    const caller = callerOwner();
+    jobs = jobs.filter(({ meta }) => isOwnJob(meta, caller));
+    if (jobs.length > 20) jobs = jobs.slice(0, 20);
+  }
   if (wantsJson(p)) {
     for (const { meta, status } of jobs) {
-      printJson({
+      const base: Record<string, unknown> = {
         id: meta.id,
         name: meta.name,
         state: effectiveState(meta, status),
         exit: status?.exit_code ?? null,
         exit_code: status?.exit_code ?? null,
-        cmd: meta.command.join(" "),
+        cmd: shellQuote(meta.command),
         command: meta.command,
-        heartbeats: status?.heartbeats ?? 0,
+        heartbeats: status?.heartbeats ?? status?.heartbeats_sent ?? 0,
         created_ms: meta.created_ms,
         created_at: iso(meta.created_ms),
         done_ms: status?.done_ms ?? null,
         done_at: iso(status?.done_ms ?? null),
         duration_ms: status?.duration_ms ?? null,
-      });
+      };
+      if (showAll) base["owner"] = meta.owner_id ?? null;
+      printJson(base);
     }
     return 0;
   }
@@ -350,11 +386,21 @@ function cmdList(argv: string[]): number {
     console.log("no jobs");
     return 0;
   }
-  console.log(`${"ID".padEnd(22)} ${"NAME".padEnd(12)} ${"STATE".padEnd(8)} COMMAND`);
-  for (const { meta, status } of jobs) {
-    console.log(
-      `${meta.id.padEnd(22)} ${meta.name.padEnd(12)} ${effectiveState(meta, status).padEnd(8)} ${meta.command.join(" ")}`,
-    );
+  if (showAll) {
+    console.log(`${"ID".padEnd(22)} ${"NAME".padEnd(12)} ${"STATE".padEnd(8)} ${"OWNER".padEnd(12)} COMMAND`);
+    for (const { meta, status } of jobs) {
+      const ownerText = String(meta.owner_id ?? "");
+      console.log(
+        `${meta.id.padEnd(22)} ${meta.name.padEnd(12)} ${effectiveState(meta, status).padEnd(8)} ${ownerText.padEnd(12)} ${shellQuote(meta.command)}`,
+      );
+    }
+  } else {
+    console.log(`${"ID".padEnd(22)} ${"NAME".padEnd(12)} ${"STATE".padEnd(8)} COMMAND`);
+    for (const { meta, status } of jobs) {
+      console.log(
+        `${meta.id.padEnd(22)} ${meta.name.padEnd(12)} ${effectiveState(meta, status).padEnd(8)} ${shellQuote(meta.command)}`,
+      );
+    }
   }
   return 0;
 }
@@ -388,6 +434,11 @@ function cmdShow(argv: string[]): number {
   const hbBase = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
   const hbFixed = meta.heartbeat_fixed ?? false;
   const hbCurrent = status?.heartbeat_current_ms ?? hbBase;
+  const hbSent = status?.heartbeats_sent ?? status?.heartbeats ?? 0;
+  const hbBackoff = status?.heartbeats_skipped_backoff ?? 0;
+  const hbBusy = status?.heartbeats_skipped_busy ?? 0;
+  const hbFailed = status?.heartbeats_failed ?? 0;
+  const hbSkipped = hbBackoff + hbBusy;
   if (wantsJson(p)) {
     const raw = readTailDetailed(dir, tail);
     const out = sanitiseOutput(raw.text);
@@ -396,7 +447,7 @@ function cmdShow(argv: string[]): number {
       id: meta.id,
       name: meta.name,
       command: meta.command,
-      command_string: meta.command.join(" "),
+      command_string: shellQuote(meta.command),
       cwd: meta.cwd,
       created_ms: meta.created_ms,
       created_at: iso(meta.created_ms),
@@ -414,7 +465,11 @@ function cmdShow(argv: string[]): number {
       heartbeat_ms: hbBase,
       heartbeat_fixed: hbFixed,
       heartbeat_current_ms: hbCurrent,
-      heartbeats: status?.heartbeats ?? 0,
+      heartbeats: status?.heartbeats ?? hbSent,
+      heartbeats_sent: hbSent,
+      heartbeats_skipped_backoff: hbBackoff,
+      heartbeats_skipped_busy: hbBusy,
+      heartbeats_failed: hbFailed,
       last_heartbeat_ms: status?.last_heartbeat_ms ?? null,
       last_heartbeat_at: iso(status?.last_heartbeat_ms ?? null),
       last_heartbeat_detail: status?.last_heartbeat_detail ?? "",
@@ -429,7 +484,7 @@ function cmdShow(argv: string[]): number {
   }
   console.log(`job ${meta.id}`);
   console.log(`name ${meta.name}`);
-  console.log(`command ${meta.command.join(" ")}`);
+  console.log(`command ${shellQuote(meta.command)}`);
   console.log(`cwd ${meta.cwd}`);
   console.log(`state ${state}`);
   if (state === "lost") console.log(`lost: supervisor died without writing a final status`);
@@ -444,7 +499,7 @@ function cmdShow(argv: string[]): number {
   if (status?.notify_note) console.log(`notify_note ${status.notify_note}`);
   console.log(`heartbeat ${hbBase === null ? "off" : `${hbBase}ms`}`);
   if (hbBase !== null) console.log(`heartbeat_current ${hbCurrent === null ? "off" : `${hbCurrent}ms`}`);
-  if ((status?.heartbeats ?? 0) > 0) console.log(`heartbeats ${status!.heartbeats}`);
+  console.log(`heartbeats sent ${hbSent}, skipped ${hbSkipped} (backoff ${hbBackoff}, busy ${hbBusy}), failed ${hbFailed}`);
   if (status?.last_heartbeat_detail) console.log(`last_heartbeat ${status.last_heartbeat_detail}`);
   console.log(`--- output (last ${tail} lines) ---`);
   const rawTail = readTailDetailed(dir, tail);
@@ -544,10 +599,15 @@ function cmdCheck(argv: string[]): number {
     notifyDetail = "notify: n/a (no notify target)";
   } else {
     const outcome = status?.notify_outcome ?? "";
-    const okOutcome = outcome === "delivered" || outcome === "unconfirmed";
-    if (outcome !== "") {
-      notifyOk = okOutcome;
-      notifyDetail = okOutcome ? `notify: ${detail}` : `notify: not delivered [${outcome}] (${detail || "no notify recorded"})`;
+    if (outcome === "delivered") {
+      notifyOk = true;
+      notifyDetail = `notify: delivered: ${detail}`;
+    } else if (outcome === "unconfirmed") {
+      notifyOk = true;
+      notifyDetail = `notify: unconfirmed (delivery not verified): ${detail}`;
+    } else if (outcome !== "") {
+      notifyOk = false;
+      notifyDetail = `notify: not delivered [${outcome}] (${detail || "no notify recorded"})`;
     } else {
       const notified = status?.notified === true;
       notifyOk = notified;
@@ -570,6 +630,12 @@ function cmdCheck(argv: string[]): number {
         ? `FAIL success: state is ${state} with no exit code`
         : `FAIL success: exit ${code} (state is ${state})`;
   const exitCode = pass === 4 && success ? 0 : 1;
+  const hbSent = status?.heartbeats_sent ?? status?.heartbeats ?? 0;
+  const hbBackoff = status?.heartbeats_skipped_backoff ?? 0;
+  const hbBusy = status?.heartbeats_skipped_busy ?? 0;
+  const hbFailed = status?.heartbeats_failed ?? 0;
+  const hbSkipped = hbBackoff + hbBusy;
+  const hbLine = `heartbeats sent ${hbSent}, skipped ${hbSkipped} (backoff ${hbBackoff}, busy ${hbBusy}), failed ${hbFailed}`;
   if (wantsJson(p)) {
     printJson({
       id,
@@ -587,6 +653,11 @@ function cmdCheck(argv: string[]): number {
       notify_ok: notifyOk,
       notify_detail_line: notifyDetail,
       progress_notify: lastProgress,
+      heartbeats: status?.heartbeats ?? hbSent,
+      heartbeats_sent: hbSent,
+      heartbeats_skipped_backoff: hbBackoff,
+      heartbeats_skipped_busy: hbBusy,
+      heartbeats_failed: hbFailed,
       checks,
       pass,
       total: 4,
@@ -605,6 +676,7 @@ function cmdCheck(argv: string[]): number {
   line(outputOk, outputDetail);
   line(notifyOk, notifyDetail);
   if (lastProgress !== "") console.log(`progress notify: ${lastProgress}`);
+  console.log(hbLine);
   console.log(`check ${id}: ${humanPass}/4 pass`);
   console.log(successDetail);
   return exitCode;
@@ -745,7 +817,11 @@ function cmdKill(argv: string[]): number {
       notify_route: null,
       notify_agent: null,
       notify_note: null,
-      heartbeats: prev?.heartbeats ?? 0,
+      heartbeats: prev?.heartbeats ?? prev?.heartbeats_sent ?? 0,
+      heartbeats_sent: prev?.heartbeats_sent ?? prev?.heartbeats ?? 0,
+      heartbeats_skipped_backoff: prev?.heartbeats_skipped_backoff ?? 0,
+      heartbeats_skipped_busy: prev?.heartbeats_skipped_busy ?? 0,
+      heartbeats_failed: prev?.heartbeats_failed ?? 0,
       last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
       last_heartbeat_detail: prev?.last_heartbeat_detail ?? detail,
       error: prev?.error ?? null,
@@ -815,7 +891,11 @@ function cmdKill(argv: string[]): number {
         notify_route: null,
         notify_agent: null,
         notify_note: null,
-        heartbeats: prevE?.heartbeats ?? 0,
+        heartbeats: prevE?.heartbeats ?? prevE?.heartbeats_sent ?? 0,
+        heartbeats_sent: prevE?.heartbeats_sent ?? prevE?.heartbeats ?? 0,
+        heartbeats_skipped_backoff: prevE?.heartbeats_skipped_backoff ?? 0,
+        heartbeats_skipped_busy: prevE?.heartbeats_skipped_busy ?? 0,
+        heartbeats_failed: prevE?.heartbeats_failed ?? 0,
         last_heartbeat_ms: prevE?.last_heartbeat_ms ?? null,
         last_heartbeat_detail: prevE?.last_heartbeat_detail ?? "",
         error: prevE?.error ?? null,
@@ -875,7 +955,11 @@ function cmdKill(argv: string[]): number {
     notify_route: null,
     notify_agent: null,
     notify_note: null,
-    heartbeats: prev?.heartbeats ?? 0,
+    heartbeats: prev?.heartbeats ?? prev?.heartbeats_sent ?? 0,
+    heartbeats_sent: prev?.heartbeats_sent ?? prev?.heartbeats ?? 0,
+    heartbeats_skipped_backoff: prev?.heartbeats_skipped_backoff ?? 0,
+    heartbeats_skipped_busy: prev?.heartbeats_skipped_busy ?? 0,
+    heartbeats_failed: prev?.heartbeats_failed ?? 0,
     last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
     last_heartbeat_detail: prev?.last_heartbeat_detail ?? "",
     error: prev?.error ?? null,
@@ -890,8 +974,8 @@ function cmdKill(argv: string[]): number {
 }
 
 function cmdClean(argv: string[]): number {
-  const p = parseArgs(argv, ["json"]);
-  unknownFlags(p, ["older-than", "json"]);
+  const p = parseArgs(argv, ["all", "json"]);
+  unknownFlags(p, ["older-than", "all", "json"]);
   if (bool(p, "help")) {
     console.log(HELP["clean"]);
     return 0;
@@ -901,23 +985,34 @@ function cmdClean(argv: string[]): number {
   const root = stateRoot();
   const older = str(p, "older-than");
   const cutoff = older !== undefined ? nowMs() - parseDurationMs(older) : null;
+  const showAll = bool(p, "all");
+  const caller = callerOwner();
   let removed = 0;
   const removedIds: string[] = [];
+  let skippedOtherOwner = 0;
   for (const { meta, status } of allJobs(root)) {
     if (effectiveState(meta, status) === "running") continue;
     if (cutoff !== null) {
       const done = status?.done_ms ?? meta.created_ms;
       if (done > cutoff) continue;
     }
+    if (!showAll && !isOwnJob(meta, caller)) {
+      skippedOtherOwner++;
+      continue;
+    }
     fs.rmSync(jobDir(root, meta.id), { recursive: true, force: true });
     removed++;
     removedIds.push(meta.id);
   }
   if (wantsJson(p)) {
-    printJson({ removed, removed_ids: removedIds });
+    printJson({ removed, removed_ids: removedIds, skipped_other_owner: skippedOtherOwner });
     return 0;
   }
-  console.log(`removed ${removed} jobs`);
+  if (skippedOtherOwner > 0) {
+    console.log(`removed ${removed} jobs, skipped ${skippedOtherOwner} other-owner jobs`);
+  } else {
+    console.log(`removed ${removed} jobs`);
+  }
   return 0;
 }
 
@@ -1045,6 +1140,7 @@ async function cmdRun(argv: string[]): Promise<number> {
   ensureDir0700(dir, true, true);
   const owner = currentOwner();
   const target = defaultTarget(str(p, "notify"), owner);
+  const ownerId = callerOwner();
   const meta: Meta = {
     id,
     name: sanitizeName(str(p, "name") ?? "job"),
@@ -1052,6 +1148,7 @@ async function cmdRun(argv: string[]): Promise<number> {
     cwd,
     created_ms: nowMs(),
     owner,
+    owner_id: ownerId,
     notify_target: target,
     heartbeat_ms: heartbeatMs,
     child_pid: null,
@@ -1074,6 +1171,10 @@ async function cmdRun(argv: string[]): Promise<number> {
     notify_agent: null,
     notify_note: null,
     heartbeats: 0,
+    heartbeats_sent: 0,
+    heartbeats_skipped_backoff: 0,
+    heartbeats_skipped_busy: 0,
+    heartbeats_failed: 0,
     last_heartbeat_ms: null,
     last_heartbeat_detail: "",
     error: null,
@@ -1102,7 +1203,7 @@ async function cmdRun(argv: string[]): Promise<number> {
         id,
         name: meta.name,
         command: meta.command,
-        command_string: meta.command.join(" "),
+        command_string: shellQuote(meta.command),
         cwd,
         created_ms: meta.created_ms,
         created_at: iso(meta.created_ms),
@@ -1131,7 +1232,7 @@ async function cmdRun(argv: string[]): Promise<number> {
         id,
         name: meta.name,
         command: meta.command,
-        command_string: meta.command.join(" "),
+        command_string: shellQuote(meta.command),
         cwd,
         created_ms: meta.created_ms,
         created_at: iso(meta.created_ms),
@@ -1158,7 +1259,7 @@ async function cmdRun(argv: string[]): Promise<number> {
       id,
       name: meta.name,
       command: meta.command,
-      command_string: meta.command.join(" "),
+      command_string: shellQuote(meta.command),
       cwd,
       created_ms: meta.created_ms,
       created_at: iso(meta.created_ms),
@@ -1244,7 +1345,7 @@ async function supervise(id: string): Promise<number> {
   } catch (e) {
     fs.closeSync(logFd);
     const msg = e instanceof Error ? e.message : String(e);
-    const startError = `could not start '${meta.command.join(" ")}': ${msg}`;
+    const startError = `could not start '${shellQuote(meta.command)}': ${msg}`;
     const failedAt = nowMs();
     writeStatus(dir, {
       state: "failed",
@@ -1258,6 +1359,10 @@ async function supervise(id: string): Promise<number> {
       notify_agent: null,
       notify_note: null,
       heartbeats: 0,
+      heartbeats_sent: 0,
+      heartbeats_skipped_backoff: 0,
+      heartbeats_skipped_busy: 0,
+      heartbeats_failed: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
@@ -1274,6 +1379,10 @@ async function supervise(id: string): Promise<number> {
       duration_ms: failedAt - started,
       ...statusFromNotify(result),
       heartbeats: 0,
+      heartbeats_sent: 0,
+      heartbeats_skipped_backoff: 0,
+      heartbeats_skipped_busy: 0,
+      heartbeats_failed: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
@@ -1283,7 +1392,7 @@ async function supervise(id: string): Promise<number> {
   }
   if (!child || child.pid === undefined) {
     fs.closeSync(logFd);
-    const startError = `could not start '${meta.command.join(" ")}': spawn failed`;
+    const startError = `could not start '${shellQuote(meta.command)}': spawn failed`;
     const failedAt = nowMs();
     writeStatus(dir, {
       state: "failed",
@@ -1292,6 +1401,10 @@ async function supervise(id: string): Promise<number> {
       duration_ms: failedAt - started,
       ...statusFromNotify(notify(meta.notify_target, `shell job '${meta.name}' failed to start. Read with: agent-shell show ${meta.id}`)),
       heartbeats: 0,
+      heartbeats_sent: 0,
+      heartbeats_skipped_backoff: 0,
+      heartbeats_skipped_busy: 0,
+      heartbeats_failed: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
@@ -1304,7 +1417,10 @@ async function supervise(id: string): Promise<number> {
   meta.pgid = child.pid;
   writeMeta(dir, meta);
 
-  let heartbeats = 0;
+  let heartbeatsSent = 0;
+  let heartbeatsSkippedBackoff = 0;
+  let heartbeatsSkippedBusy = 0;
+  let heartbeatsFailed = 0;
   let lastHeartbeatMs: number | null = null;
   let lastHeartbeatDetail = "";
   let finished = false;
@@ -1325,15 +1441,17 @@ async function supervise(id: string): Promise<number> {
     });
   });
 
-  // Progress notifies while the command runs: last output line every heartbeatMs,
-  // via `hcx send --if idle` so a busy agent is skipped (a skipped heartbeat
-  // is not a failure and is not retried). Completion never uses `--if`.
-  // When the last line is unchanged and back-off is enabled, skip the notify
-  // and double the interval up to the cap; reset on new output. Skipped
-  // heartbeats are not failures. Skipped entirely when disabled or no target.
-  // The wait races the heartbeat interval against process exit, so a job
-  // shorter than the interval finishes at once with no progress notify.
-  // An unreadable status (null) is not "not running": keep supervising.
+  // Progress notifies while the command runs: last output line every heartbeatMs.
+  // Heartbeats read the target status via `hcx ls --json` (5s timeout, one
+  // call per heartbeat) and skip when it is working or blocked; a busy skip
+  // counts as skipped, not failed. Completion sends unconditionally. Neither
+  // uses `--if idle` or retries. When the last line is unchanged and
+  // back-off is enabled, skip the notify and double the interval up to the
+  // cap; reset on new output. Skipped heartbeats are not failures. Skipped
+  // entirely when disabled or no target. The wait races the heartbeat
+  // interval against process exit, so a job shorter than the interval
+  // finishes at once with no progress notify. An unreadable status (null) is
+  // not "not running": keep supervising.
   if (heartbeatMs !== null && meta.notify_target !== "") {
     const done = exitPromise.then(
       () => {},
@@ -1341,6 +1459,29 @@ async function supervise(id: string): Promise<number> {
     );
     let prevLine: string | null = null;
     let unchangedStreak = 0;
+    const writeRunning = (): void => {
+      writeStatus(dir, {
+        state: "running",
+        exit_code: null,
+        done_ms: null,
+        duration_ms: null,
+        notified: false,
+        notify_detail: "",
+        notify_outcome: "",
+        notify_route: null,
+        notify_agent: null,
+        notify_note: null,
+        heartbeats: heartbeatsSent,
+        heartbeats_sent: heartbeatsSent,
+        heartbeats_skipped_backoff: heartbeatsSkippedBackoff,
+        heartbeats_skipped_busy: heartbeatsSkippedBusy,
+        heartbeats_failed: heartbeatsFailed,
+        last_heartbeat_ms: lastHeartbeatMs,
+        last_heartbeat_detail: lastHeartbeatDetail,
+        error: null,
+        heartbeat_current_ms: currentInterval,
+      });
+    };
     for (;;) {
       await Promise.race([done, Bun.sleep(currentInterval as number)]);
       if (finished) break;
@@ -1353,25 +1494,10 @@ async function supervise(id: string): Promise<number> {
         const next = Math.min((currentInterval as number) * 2, heartbeatCap);
         currentInterval = next;
         if (unchangedStreak >= 2) {
+          heartbeatsSkippedBackoff++;
           lastHeartbeatMs = nowMs();
           lastHeartbeatDetail = `skipped: no new output (next heartbeat in ${formatElapsed(next)})`;
-          writeStatus(dir, {
-            state: "running",
-            exit_code: null,
-            done_ms: null,
-            duration_ms: null,
-            notified: false,
-            notify_detail: "",
-            notify_outcome: "",
-            notify_route: null,
-            notify_agent: null,
-            notify_note: null,
-            heartbeats,
-            last_heartbeat_ms: lastHeartbeatMs,
-            last_heartbeat_detail: lastHeartbeatDetail,
-            error: null,
-            heartbeat_current_ms: currentInterval,
-          });
+          writeRunning();
           if (finished) break;
           continue;
         }
@@ -1385,26 +1511,12 @@ async function supervise(id: string): Promise<number> {
         (last !== "" ? `Last line: ${last.slice(0, 160)}. ` : `No output yet. `) +
         `No action needed; completion will notify. Read with: agent-shell tail ${meta.id}`;
       const hbResult = notify(meta.notify_target, hbText, { ifIdle: true });
-      if (hbResult.outcome === "delivered" || hbResult.outcome === "unconfirmed") heartbeats++;
+      if (hbResult.outcome === "delivered" || hbResult.outcome === "unconfirmed") heartbeatsSent++;
+      else if (hbResult.outcome === "skipped_busy") heartbeatsSkippedBusy++;
+      else heartbeatsFailed++;
       lastHeartbeatMs = nowMs();
       lastHeartbeatDetail = hbResult.detail;
-      writeStatus(dir, {
-        state: "running",
-        exit_code: null,
-        done_ms: null,
-        duration_ms: null,
-        notified: false,
-        notify_detail: "",
-        notify_outcome: "",
-        notify_route: null,
-        notify_agent: null,
-        notify_note: null,
-        heartbeats,
-        last_heartbeat_ms: lastHeartbeatMs,
-        last_heartbeat_detail: lastHeartbeatDetail,
-        error: null,
-        heartbeat_current_ms: currentInterval,
-      });
+      writeRunning();
       if (finished) break;
     }
   }
@@ -1429,7 +1541,11 @@ async function supervise(id: string): Promise<number> {
     notify_route: null,
     notify_agent: null,
     notify_note: null,
-    heartbeats,
+    heartbeats: heartbeatsSent,
+    heartbeats_sent: heartbeatsSent,
+    heartbeats_skipped_backoff: heartbeatsSkippedBackoff,
+    heartbeats_skipped_busy: heartbeatsSkippedBusy,
+    heartbeats_failed: heartbeatsFailed,
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
     error: null,
@@ -1448,7 +1564,11 @@ async function supervise(id: string): Promise<number> {
     done_ms: done,
     duration_ms: done - started,
     ...statusFromNotify(result),
-    heartbeats,
+    heartbeats: heartbeatsSent,
+    heartbeats_sent: heartbeatsSent,
+    heartbeats_skipped_backoff: heartbeatsSkippedBackoff,
+    heartbeats_skipped_busy: heartbeatsSkippedBusy,
+    heartbeats_failed: heartbeatsFailed,
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
     error: null,

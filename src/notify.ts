@@ -40,13 +40,39 @@ function haveHerdr(): boolean {
   }
 }
 
+/** Send timeouts: completion 30s, heartbeat 10s, `hcx ls` pre-check 5s. */
+export const COMPLETION_TIMEOUT_MS = 30_000;
+export const HEARTBEAT_TIMEOUT_MS = 10_000;
+export const HCX_LS_TIMEOUT_MS = 5_000;
+
 /** The typed notify outcome. `delivered` is a confirmed turn, `not_started`
  * is a confirmed send that started no turn (do not resend), `unconfirmed` is
- * `delivered: null` (opencode TUI or shell with no turn status, never resend),
- * `plain_shell` is the pre-send refusal (exit 4, queued not delivered), and
- * `failed` is anything else (timeout or nonzero after the send may have
- * landed: never retry automatically). */
-export type NotifyOutcome = "delivered" | "not_started" | "unconfirmed" | "plain_shell" | "failed";
+ * `delivered: null` (opencode TUI or shell with no turn status, never resend)
+ * or a completion send that timed out (exit null / kind timeout: it may have
+ * landed, never resend), `plain_shell` is the pre-send refusal (exit 4,
+ * queued not delivered), `skipped_busy` is a heartbeat skipped because the
+ * target is working or blocked (not a failure), and `failed` is anything
+ * else (never retry automatically). */
+export type NotifyOutcome =
+  | "delivered"
+  | "not_started"
+  | "unconfirmed"
+  | "plain_shell"
+  | "skipped_busy"
+  | "failed";
+
+/** Cached per process: true once the old herdr route has shown the server is
+ * not running, so later notifies skip it silently. */
+let herdrUnavailableCached = false;
+
+/** Reset the herdr-route cache (tests only). */
+export function resetHerdrCacheForTests(): void {
+  herdrUnavailableCached = false;
+}
+
+function isServerNotRunning(text: string): boolean {
+  return text.includes("server_not_running");
+}
 
 /** One notify attempt: the outcome plus the human-readable detail line, and
  * the machine fields from `hcx send --json` when the send ran. */
@@ -116,17 +142,92 @@ function checkHcxSupport(): HcxSupport {
   }
 }
 
-function herdrNotify(target: string, text: string): NotifyResult {
+function herdrNotify(target: string, text: string, timeoutMs: number, isCompletion: boolean): NotifyResult {
   try {
-    const p = spawnSync("herdr", ["agent", "prompt", target, text], { encoding: "utf8", timeout: 8000 });
+    const p = spawnSync("herdr", ["agent", "prompt", target, text], { encoding: "utf8", timeout: timeoutMs });
     if (p.status === 0) return { outcome: "delivered", detail: `notified ${target}`, route: null, agent: null, note: null };
-    const err = (p.stderr as string).trim();
+    const err = ((p.stderr as string) ?? "").trim();
     const reason = err === "" ? `exit ${p.status}` : err.split("\n")[0]!;
+    if (p.status === null && isCompletion) {
+      return {
+        outcome: "unconfirmed",
+        detail: `notify to ${target} timed out after ${Math.round(timeoutMs / 1000)}s (delivery not verified; the message may have landed, never retry): ${reason}`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
     return { outcome: "failed", detail: `notify to ${target} failed: ${reason}`, route: null, agent: null, note: null };
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
-    return { outcome: "failed", detail: `notify to ${target} failed: ${reason.split("\n")[0]}`, route: null, agent: null, note: null };
+    const first = reason.split("\n")[0]!;
+    if (isCompletion && (/timed out|timeout|ETIMEDOUT|exit null/i.test(first) || /spawnSync.*timeout/i.test(reason))) {
+      return {
+        outcome: "unconfirmed",
+        detail: `notify to ${target} timed out after ${Math.round(timeoutMs / 1000)}s (delivery not verified; the message may have landed, never retry): ${first}`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
+    return { outcome: "failed", detail: `notify to ${target} failed: ${first}`, route: null, agent: null, note: null };
   }
+}
+
+/** Read the target's status via `hcx ls --json` (one call, 5s timeout).
+ * Matches the terminal address or name. Returns the lowercase status, or
+ * null when unknown (ls failed, timed out, or no match): callers send
+ * anyway (fail-open). */
+function hcxTargetStatus(target: string): string | null {
+  let p: ReturnType<typeof spawnSync>;
+  try {
+    p = spawnSync("hcx", ["ls", "--json"], { encoding: "utf8", timeout: HCX_LS_TIMEOUT_MS });
+  } catch {
+    return null;
+  }
+  if (p.status !== 0) return null;
+  const raw = ((p.stdout as string) ?? "").trim();
+  if (raw === "") return null;
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  let items: unknown[] | null = null;
+  if (Array.isArray(v)) items = v;
+  else if (typeof v === "object" && v !== null) {
+    const rec = v as Record<string, unknown>;
+    for (const key of ["agents", "terminals", "panes", "items", "list", "tabs", "sessions"]) {
+      if (Array.isArray(rec[key])) {
+        items = rec[key] as unknown[];
+        break;
+      }
+    }
+    if (!items) {
+      for (const val of Object.values(rec)) {
+        if (Array.isArray(val)) {
+          items = val as unknown[];
+          break;
+        }
+      }
+    }
+  }
+  if (!items) return null;
+  for (const item of items) {
+    if (typeof item !== "object" || item === null) continue;
+    const rec = item as Record<string, unknown>;
+    const candidates: string[] = [];
+    for (const key of ["address", "pane", "pane_id", "name", "terminal", "terminal_id", "id", "tab", "title"]) {
+      const val = rec[key];
+      if (typeof val === "string" && val !== "") candidates.push(val);
+    }
+    if (!candidates.includes(target)) continue;
+    const status = rec["status"];
+    if (typeof status === "string" && status !== "") return status.toLowerCase();
+    return null;
+  }
+  return null;
 }
 
 function tryParseJson(text: string): Record<string, unknown> | null {
@@ -159,21 +260,43 @@ function parseHcxError(stdout: string, stderr: string): { kind: string; message:
 }
 
 /** One `hcx send --agent-only --no-footer --json` attempt, argv with no
- * shell. Heartbeats add `--if idle` so a busy agent is skipped; completion
- * never uses `--if`. Never retries: a nonzero exit after the send may have
- * landed. */
-function hcxNotify(target: string, text: string, ifIdle: boolean): NotifyResult {
-  const args = ["send", "--agent-only", "--no-footer", "--json"];
-  if (ifIdle) args.push("--if", "idle");
-  args.push(target, text);
+ * shell. Heartbeats first read the target status via `hcx ls --json` (5s
+ * timeout) and skip when it is `working` or `blocked`; completion sends
+ * unconditionally. Never uses `--if idle` and never retries: a nonzero exit
+ * after the send may have landed. */
+function hcxNotify(target: string, text: string, isHeartbeat: boolean): NotifyResult {
+  if (isHeartbeat) {
+    const st = hcxTargetStatus(target);
+    if (st === "working" || st === "blocked") {
+      return {
+        outcome: "skipped_busy",
+        detail: `skipped: target ${target} is ${st} (busy; heartbeat skipped)`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
+  }
+  const timeoutMs = isHeartbeat ? HEARTBEAT_TIMEOUT_MS : COMPLETION_TIMEOUT_MS;
+  const args = ["send", "--agent-only", "--no-footer", "--json", target, text];
   let p: ReturnType<typeof spawnSync>;
   try {
-    p = spawnSync("hcx", args, { encoding: "utf8", timeout: 8000 });
+    p = spawnSync("hcx", args, { encoding: "utf8", timeout: timeoutMs });
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
+    const first = reason.split("\n")[0]!;
+    if (!isHeartbeat && (/timed out|timeout|ETIMEDOUT/i.test(first) || /spawnSync.*timeout/i.test(reason))) {
+      return {
+        outcome: "unconfirmed",
+        detail: `notify to ${target} timed out after ${Math.round(timeoutMs / 1000)}s (delivery not verified; the message may have landed, never retry): ${first}`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
     return {
       outcome: "failed",
-      detail: `notify to ${target} failed: ${reason.split("\n")[0]} (never retried; the send may have landed)`,
+      detail: `notify to ${target} failed: ${first} (never retried; the send may have landed)`,
       route: null,
       agent: null,
       note: null,
@@ -194,6 +317,15 @@ function hcxNotify(target: string, text: string, ifIdle: boolean): NotifyResult 
       if (delivered === false) {
         const why = note ?? "did not start a turn; it may still have arrived, read before resending";
         const who = agent ? ` (agent ${agent})` : "";
+        if (isHeartbeat) {
+          return {
+            outcome: "skipped_busy",
+            detail: `skipped: target ${target} busy (started no turn${who}: ${why}; heartbeat skipped)`,
+            route,
+            agent,
+            note,
+          };
+        }
         return {
           outcome: "not_started",
           detail: `notify to ${target} started no turn${who}: ${why} (do not resend)`,
@@ -241,6 +373,15 @@ function hcxNotify(target: string, text: string, ifIdle: boolean): NotifyResult 
       };
     }
     if (parsed.kind === "timeout") {
+      if (!isHeartbeat) {
+        return {
+          outcome: "unconfirmed",
+          detail: `notify to ${target} timed out after ${Math.round(timeoutMs / 1000)}s (delivery not verified; the message may have landed, never retry): ${msg}${hint}`,
+          route: null,
+          agent: null,
+          note: null,
+        };
+      }
       return {
         outcome: "failed",
         detail: `notify to ${target} failed: ${msg}${hint} (timed out; the message may have landed, never retry)`,
@@ -257,6 +398,17 @@ function hcxNotify(target: string, text: string, ifIdle: boolean): NotifyResult 
       note: null,
     };
   }
+  if (p.status === null && !isHeartbeat) {
+    const errText = (stderr.trim() === "" ? stdout.trim() : stderr.trim()).split("\n")[0] ?? "";
+    const reason = errText === "" ? `exit null` : errText;
+    return {
+      outcome: "unconfirmed",
+      detail: `notify to ${target} timed out after ${Math.round(timeoutMs / 1000)}s (delivery not verified; the message may have landed, never retry): ${reason}`,
+      route: null,
+      agent: null,
+      note: null,
+    };
+  }
   const errText = (stderr.trim() === "" ? stdout.trim() : stderr.trim()).split("\n")[0] ?? "";
   const reason = errText === "" ? `exit ${p.status}` : errText;
   return {
@@ -268,18 +420,25 @@ function hcxNotify(target: string, text: string, ifIdle: boolean): NotifyResult 
   };
 }
 
-/** Send one notification turn. Heartbeats pass `{ ifIdle: true }` so a busy
- * agent is skipped (a skipped heartbeat is not a failure and is not
- * retried); completion never uses `--if`. */
+/** Send one notification turn. Heartbeats pass `{ ifIdle: true }`: the target
+ * status is read via `hcx ls --json` (5s timeout, one call per heartbeat) and
+ * the heartbeat is skipped when it is `working` or `blocked` (a busy skip
+ * counts as skipped, not failed). Completion sends unconditionally. Neither
+ * route uses `--if idle` or retries after a send that may have landed. The
+ * old herdr route is tried once per process; when it reports
+ * `server_not_running` it is skipped silently afterwards, and failure details
+ * describe only routes actually tried. */
 export function notify(target: string, text: string, opts?: { ifIdle?: boolean }): NotifyResult {
-  const ifIdle = opts?.ifIdle === true;
+  const isHeartbeat = opts?.ifIdle === true;
+  const timeoutMs = isHeartbeat ? HEARTBEAT_TIMEOUT_MS : COMPLETION_TIMEOUT_MS;
+  const isCompletion = !isHeartbeat;
   if (target.trim() === "") {
     return { outcome: "failed", detail: "skipped: no notify target (outside herdr and herdr-core, and no --notify)", route: null, agent: null, note: null };
   }
   const herdr = haveHerdr();
   const support = hcxSupport();
-  if (!herdr && !support.ok) {
-    if (/not on PATH/.test(support.reason)) {
+  if ((!herdr || herdrUnavailableCached) && !support.ok) {
+    if (/not on PATH/.test(support.reason) && !herdr) {
       return {
         outcome: "failed",
         detail: "skipped: herdr is not on PATH and hcx is not on PATH (install hcx >= 0.3.0)",
@@ -287,6 +446,37 @@ export function notify(target: string, text: string, opts?: { ifIdle?: boolean }
         agent: null,
         note: null,
       };
+    }
+    if (!herdr || herdrUnavailableCached) {
+      return {
+        outcome: "failed",
+        detail: `notify to ${target} not delivered: ${support.reason} (install hcx >= 0.3.0)`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
+  }
+  let herdrDetail: string | null = null;
+  if (herdr && !herdrUnavailableCached) {
+    const done = herdrNotify(target, text, timeoutMs, isCompletion);
+    if (done.outcome === "delivered") return done;
+    if (isCompletion && done.outcome === "unconfirmed") return done;
+    if (isServerNotRunning(done.detail)) {
+      herdrUnavailableCached = true;
+      herdrDetail = null;
+    } else {
+      herdrDetail = done.detail;
+      if (!support.ok) {
+        const hint = /not on PATH/.test(support.reason) ? "install hcx >= 0.3.0" : `${support.reason} (install hcx >= 0.3.0)`;
+        return { outcome: "failed", detail: `${done.detail}; ${hint}`, route: null, agent: null, note: null };
+      }
+    }
+  }
+  if (!support.ok) {
+    if (herdrDetail !== null) {
+      const hint = /not on PATH/.test(support.reason) ? "install hcx >= 0.3.0" : `${support.reason} (install hcx >= 0.3.0)`;
+      return { outcome: "failed", detail: `${herdrDetail}; ${hint}`, route: null, agent: null, note: null };
     }
     return {
       outcome: "failed",
@@ -296,18 +486,12 @@ export function notify(target: string, text: string, opts?: { ifIdle?: boolean }
       note: null,
     };
   }
-  if (herdr) {
-    const done = herdrNotify(target, text);
-    if (done.outcome === "delivered") return done;
-    if (!support.ok) {
-      const hint = /not on PATH/.test(support.reason) ? "install hcx >= 0.3.0" : `${support.reason} (install hcx >= 0.3.0)`;
-      return { outcome: "failed", detail: `${done.detail}; ${hint}`, route: null, agent: null, note: null };
-    }
-    const fallback = hcxNotify(target, text, ifIdle);
-    if (fallback.outcome === "delivered" || fallback.outcome === "unconfirmed") return fallback;
-    return { outcome: "failed", detail: `${done.detail}; ${fallback.detail}`, route: fallback.route, agent: fallback.agent, note: fallback.note };
+  const fallback = hcxNotify(target, text, isHeartbeat);
+  if (fallback.outcome === "delivered" || fallback.outcome === "unconfirmed" || fallback.outcome === "skipped_busy") return fallback;
+  if (herdrDetail !== null) {
+    return { outcome: "failed", detail: `${herdrDetail}; ${fallback.detail}`, route: fallback.route, agent: fallback.agent, note: fallback.note };
   }
-  return hcxNotify(target, text, ifIdle);
+  return fallback;
 }
 
 /** Warn when hcx cannot find an explicit `--notify` target. Returns the

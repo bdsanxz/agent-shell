@@ -214,7 +214,7 @@ describe("check", () => {
     expect(c.out).toContain("ok finished: state is done");
     expect(c.out).toContain("ok exit: 0");
     expect(c.out).toContain("ok output: 1 lines");
-    expect(c.out).toContain("ok notify: notified w9:p9");
+    expect(c.out).toContain("ok notify: delivered: notified w9:p9");
     expect(c.out).toContain(`check ${id}: 4/4 pass`);
   });
 
@@ -258,7 +258,7 @@ describe("check", () => {
     waitFor(home, id, ['"done"']);
     const c = cli(home, ["check", id]);
     expect(c.code).toBe(0);
-    expect(c.out).toContain("ok notify: notified w9:p9 via hcx send --agent-only --no-footer");
+    expect(c.out).toContain("ok notify: delivered: notified w9:p9 via hcx send --agent-only --no-footer");
     expect(fs.readFileSync(hcxLog, "utf8")).toContain("send --agent-only --no-footer --json w9:p9");
   });
 
@@ -275,7 +275,7 @@ describe("check", () => {
     waitFor(home, id, ['"done"']);
     const c = cli(home, ["check", id]);
     expect(c.code).toBe(0);
-    expect(c.out).toContain("ok notify: notified t9 via hcx send --agent-only --no-footer");
+    expect(c.out).toContain("ok notify: delivered: notified t9 via hcx send --agent-only --no-footer");
   });
 
   test("running and unknown jobs exit 2", () => {
@@ -321,9 +321,15 @@ describe("hcx notify (0.3.0 contract)", () => {
   const OLD_VERSION_JSON = '{"hcx":"0.1.2","hc":"0.1.15","contract":0,"capabilities":["no-footer"]}';
 
   /** A stub bin with no herdr and no hc: only hcx. `send` always answers
-   * with `sendBehavior`; `get` answers `getBehavior`. Every hcx argv line
-   * is appended to `hcx.log` in `logDir`. */
-  function hcxBin(spec: { logDir: string; send?: SendBehavior; get?: GetBehavior; versionJson?: string }): string {
+   * with `sendBehavior`; `get` answers `getBehavior`; `ls` answers idle
+   * unless overridden. Every hcx argv line is appended to `hcx.log`. */
+  function hcxBin(spec: {
+    logDir: string;
+    send?: SendBehavior;
+    get?: GetBehavior;
+    versionJson?: string;
+    lsStatus?: string;
+  }): string {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hcx-"));
     const send = spec.send ?? "delivered";
     const get = spec.get ?? "ok";
@@ -346,9 +352,11 @@ describe("hcx notify (0.3.0 contract)", () => {
       get === "ok"
         ? `printf '%s\\n' '{"address":"t7","agent":"muse"}'\nexit 0`
         : `printf '%s\\n' '{"error":{"kind":"not_found","message":"no such terminal ghost","hint":""}}' >&2\nexit 3`;
+    const lsStatus = spec.lsStatus ?? "idle";
+    const lsCase = `printf '%s\\n' '{"agents":[{"address":"t7","status":"${lsStatus}"}]}'\nexit 0`;
     fs.writeFileSync(
       path.join(bin, "hcx"),
-      `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hcx.log"\nif [ "$1" = "--version" ]; then printf '%s\\n' '${versionJson}'; exit 0; fi\nif [ "$1" = "get" ]; then\n${getCase}\nfi\nif [ "$1" = "send" ]; then\n${sendCase}\nfi\necho "unexpected hcx call: $*" >&2\nexit 9\n`,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> "${spec.logDir}/hcx.log"\nif [ "$1" = "--version" ]; then printf '%s\\n' '${versionJson}'; exit 0; fi\nif [ "$1" = "ls" ]; then\n${lsCase}\nfi\nif [ "$1" = "get" ]; then\n${getCase}\nfi\nif [ "$1" = "send" ]; then\n${sendCase}\nfi\necho "unexpected hcx call: $*" >&2\nexit 9\n`,
     );
     fs.chmodSync(path.join(bin, "hcx"), 0o755);
     return bin;
@@ -399,7 +407,7 @@ describe("hcx notify (0.3.0 contract)", () => {
     const bin = hcxBin({ logDir, send: "delivered" });
     const { check, id } = probeCheck(home, bin, ["--notify", "t7"]);
     expect(check.code).toBe(0);
-    expect(check.out).toContain("ok notify: notified t7 via hcx send --agent-only --no-footer");
+    expect(check.out).toContain("ok notify: delivered: notified t7 via hcx send --agent-only --no-footer");
     const logged = sends(path.join(logDir, "hcx.log"));
     expect(logged).toHaveLength(1);
     expect(logged[0]).toContain("send --agent-only --no-footer --json t7");
@@ -432,7 +440,7 @@ describe("hcx notify (0.3.0 contract)", () => {
     const bin = hcxBin({ logDir, send: "unconfirmed" });
     const { check, id } = probeCheck(home, bin, ["--notify", "t7"]);
     expect(check.code).toBe(0);
-    expect(check.out).toContain("ok notify: notified t7 (unconfirmed:");
+    expect(check.out).toContain("ok notify: unconfirmed (delivery not verified)");
     expect(check.out).toContain("never resend");
     expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(1);
     const st = statusOf(home, id);
@@ -457,16 +465,16 @@ describe("hcx notify (0.3.0 contract)", () => {
     expect(st.notified).toBe(false);
   });
 
-  test("timeout is failed and never retried", () => {
+  test("timeout is unconfirmed and passes the check", () => {
     const home = freshHome();
     const logDir = freshLogDir();
     const bin = hcxBin({ logDir, send: "timeout" });
     const { check, id } = probeCheck(home, bin, ["--notify", "t7"]);
-    expect(check.code).toBe(1);
-    expect(check.out).toContain("FAIL notify: not delivered [failed]");
+    expect(check.code).toBe(0);
+    expect(check.out).toContain("ok notify: unconfirmed (delivery not verified)");
     expect(check.out).toContain("may have landed, never retry");
     expect(sends(path.join(logDir, "hcx.log"))).toHaveLength(1);
-    expect(statusOf(home, id).notify_outcome).toBe("failed");
+    expect(statusOf(home, id).notify_outcome).toBe("unconfirmed");
   });
 
   test("not_found is queued and fails the check", () => {
@@ -486,7 +494,7 @@ describe("hcx notify (0.3.0 contract)", () => {
     const bin = hcxBin({ logDir, send: "delivered" });
     const { check } = probeCheck(home, bin, ["--notify", "Vrax"]);
     expect(check.code).toBe(0);
-    expect(check.out).toContain("ok notify: notified Vrax via hcx send --agent-only --no-footer");
+    expect(check.out).toContain("ok notify: delivered: notified Vrax via hcx send --agent-only --no-footer");
     const logged = sends(path.join(logDir, "hcx.log"));
     expect(logged).toHaveLength(1);
     expect(logged[0]).toContain("Vrax");
@@ -529,7 +537,7 @@ describe("hcx notify (0.3.0 contract)", () => {
     expect(statusOf(home, id).notify_outcome).toBe("failed");
   });
 
-  test("heartbeats use --if idle, completion never does", () => {
+  test("heartbeats use ls pre-check and no --if idle, completion never does", () => {
     const home = freshHome();
     const logDir = freshLogDir();
     const bin = hcxBin({ logDir, send: "delivered" });
@@ -547,14 +555,18 @@ describe("hcx notify (0.3.0 contract)", () => {
     expect(heartbeats.length).toBeGreaterThanOrEqual(1);
     expect(completions).toHaveLength(1);
     for (const h of heartbeats) {
-      expect(h).toContain("--agent-only --no-footer --json --if idle");
+      expect(h).toContain("--agent-only --no-footer --json");
+      expect(h).not.toContain("--if idle");
     }
     for (const c of completions) {
       expect(c).toContain("--agent-only --no-footer --json");
       expect(c).not.toContain("--if idle");
     }
+    const lsCalls = readLog(path.join(logDir, "hcx.log")).split("\n").filter((l) => l.startsWith("ls "));
+    expect(lsCalls.length).toBeGreaterThanOrEqual(1);
     const st = statusOf(home, id);
     expect(st.heartbeats as number).toBeGreaterThanOrEqual(1);
+    expect(st.heartbeats_sent as number).toBeGreaterThanOrEqual(1);
   });
 
   test("a skipped heartbeat (busy agent) is not a failure and is not retried", () => {
@@ -563,7 +575,7 @@ describe("hcx notify (0.3.0 contract)", () => {
     const bin = fs.mkdtempSync(path.join(os.tmpdir(), "agent-shell-hcx-"));
     fs.writeFileSync(
       path.join(bin, "hcx"),
-      `#!/bin/sh\nprintf '%s\\n' "$*" >> "${logDir}/hcx.log"\nif [ "$1" = "--version" ]; then printf '%s\\n' '${VERSION_JSON}'; exit 0; fi\nif [ "$1" = "get" ]; then printf '%s\\n' '{"address":"t7","agent":"muse"}'; exit 0; fi\nif [ "$1" = "send" ]; then\ncase "$*" in\n*"--if idle"*) printf '%s\\n' '{"status":"working","turn":3,"started":false,"delivered":false,"route":"hcx-raw","agent":"muse","note":"did not start a turn; it may still have arrived, read before resending"}'; exit 0;;\n*) printf '%s\\n' '{"status":"idle","turn":4,"started":true,"delivered":true,"route":"hcx-raw","agent":"muse"}'; exit 0;;\nesac\nfi\necho "unexpected hcx call: $*" >&2\nexit 9\n`,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> "${logDir}/hcx.log"\nif [ "$1" = "--version" ]; then printf '%s\\n' '${VERSION_JSON}'; exit 0; fi\nif [ "$1" = "ls" ]; then printf '%s\\n' '{"agents":[{"address":"t7","status":"working"}]}'; exit 0; fi\nif [ "$1" = "get" ]; then printf '%s\\n' '{"address":"t7","agent":"muse"}'; exit 0; fi\nif [ "$1" = "send" ]; then printf '%s\\n' '{"status":"idle","turn":4,"started":true,"delivered":true,"route":"hcx-raw","agent":"muse"}'; exit 0; fi\necho "unexpected hcx call: $*" >&2\nexit 9\n`,
     );
     fs.chmodSync(path.join(bin, "hcx"), 0o755);
     const target = "t7";
@@ -577,14 +589,18 @@ describe("hcx notify (0.3.0 contract)", () => {
     waitFor(home, id, ['"done"'], 20000);
     const logged = readLog(path.join(logDir, "hcx.log")).split("\n").filter((l) => l.startsWith("send "));
     const heartbeats = logged.filter((l) => l.includes("still running"));
-    expect(heartbeats.length).toBeGreaterThanOrEqual(1);
-    for (const h of heartbeats) expect(h).toContain("--if idle");
+    expect(heartbeats).toHaveLength(0);
+    const lsCalls = readLog(path.join(logDir, "hcx.log")).split("\n").filter((l) => l.startsWith("ls "));
+    expect(lsCalls.length).toBeGreaterThanOrEqual(1);
+    for (const h of logged) expect(h).not.toContain("--if idle");
     const st = statusOf(home, id);
     expect(st.heartbeats).toBe(0);
-    expect(String(st.last_heartbeat_detail)).toContain("started no turn");
+    expect(st.heartbeats_sent).toBe(0);
+    expect(st.heartbeats_skipped_busy as number).toBeGreaterThanOrEqual(1);
+    expect(String(st.last_heartbeat_detail)).toContain("busy");
     const c = cli(home, ["check", id]);
     expect(c.code).toBe(0);
-    expect(c.out).toContain("ok notify: notified t7 via hcx send --agent-only --no-footer");
+    expect(c.out).toContain("ok notify: delivered: notified t7 via hcx send --agent-only --no-footer");
   });
 
   test("check prints the last progress notify", () => {

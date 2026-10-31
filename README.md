@@ -40,18 +40,24 @@ agent-shell clean --older-than 7d
 `run` validates `--cwd` and the executable up front (exit 2, no job created),
 then returns at once with a job id and exits: the command keeps running in
 background under a detached supervisor as the leader of its own process group
-(pgid recorded in meta), so `kill` stops grandchildren too. While it runs,
-the supervisor sends one progress notify turn every 2 minutes by default
+(pgid recorded in meta), so `kill` stops grandchildren too. Each job is owned
+by `$AGENT_SHELL_OWNER` else `$HC_TERMINAL_ID` else `$HERDR_PANE_ID` else
+ownerless (pre-0.6.0 jobs have no owner); `list` and `clean` default to your
+own jobs, `--all` means every job on the machine. While it runs, the
+supervisor sends one progress notify turn every 2 minutes by default
 (`--heartbeat <duration>` changes the base; `--no-heartbeat`,
 `--heartbeat 0` and `off` disable it), each carrying the last output line so
 you can tell stuck from working. When the last line stops changing, notifies
 back off: the interval doubles after each unchanged beat up to 30m
 (env `AGENT_SHELL_HEARTBEAT_MAX_MS` for tests) and resets on new output;
-`--heartbeat-fixed` disables back-off. Skipped-for-idle and back-off skips
-are not failures. The current interval shows in `show`
-(`heartbeat_current ...` and `--json heartbeat_current_ms`). When it
-finishes, the supervisor records the job as done or failed first, then sends
-one completion turn to the notify target (your own pane by default, or
+`--heartbeat-fixed` disables back-off. Heartbeats read the target status via
+`hcx ls --json` (5 s timeout, one call per heartbeat) and skip when it is
+`working` or `blocked`; busy and back-off skips are not failures. Counters
+show in `show` and `check` (`heartbeats sent S, skipped K (backoff B, busy U),
+failed F`) with `heartbeats` as an alias of sent. The current interval shows
+in `show` (`heartbeat_current ...` and `--json heartbeat_current_ms`). When
+it finishes, the supervisor records the job as done or failed first, then
+sends one completion turn to the notify target (your own pane by default, or
 `--notify`). If the supervisor dies without writing a final status, `show`,
 `list`, `check` and `clean` report state `lost` (exit null, partial output
 readable) instead of running forever; `check` fails it (exit 1), `kill` on
@@ -63,20 +69,25 @@ sends the completion notify with the start error, recorded in the job's
 `hcx send --agent-only --no-footer --json` (needs hcx 0.3.0 or newer;
 hcx looks the kind up first and refuses a plain shell or unknown kind before
 sending, and resolves tab names, so `--notify` takes an address or a tab
-name). A confirmed send that starts no turn is recorded as `not_started`
-(do not resend); an unconfirmed send (opencode TUI, `delivered: null`) is
-recorded as `unconfirmed` and never resent. Progress notifies use
-`--if idle`, so a busy agent is skipped instead of interrupted; completion
-never uses `--if`. Nothing polls, nothing waits: notify turns are the only
-wake-up. Read the output with `show` or `tail` (`--tail`/`--lines` need a
-positive integer): both read only the last 256 KiB (truncated reads are
-marked) and sanitise the text (CR progress bars collapsed, ANSI and control
-bytes stripped; the stored `output.log` stays raw). Verify a finished job
-before using its result with `check` (state, exit, output, completion and
-last progress notify, plus a separate `success` line for the job's own
-outcome). `check` exits 0 only when the records pass and the job succeeded
-(exit 0); its notify line is `ok` only for `delivered` or `unconfirmed`, and
-a job with no notify target reports `notify: n/a`, not a failure.
+name). The old herdr route is skipped silently when no old server runs;
+failure details name only routes actually tried. A confirmed send that starts
+no turn is recorded as `not_started` (do not resend); an unconfirmed send
+(opencode TUI, `delivered: null`) or a timed-out completion send (exit null /
+kind timeout, 30 s timeout, heartbeat 10 s) is recorded as `unconfirmed`
+(`delivery not verified`) and never resent. Completion sends unconditionally
+and never uses `--if idle`. Nothing polls, nothing waits: notify turns are
+the only wake-up. Read the output with `show` or `tail` (`--tail`/`--lines`
+need a positive integer): both read only the last 256 KiB (truncated reads
+are marked) and sanitise the text (CR progress bars collapsed, ANSI and
+control bytes stripped; the stored `output.log` stays raw). `command_string`
+is POSIX shell-quoted, so copy-paste reruns the same command; `command`
+stays the raw argv. Verify a finished job before using its result with
+`check` (state, exit, output, completion and last progress notify, plus a
+separate `success` line for the job's own outcome). `check` exits 0 only when
+the records pass and the job succeeded (exit 0); its notify line is `ok`
+only for `delivered` (`ok notify: delivered: ...`) or `unconfirmed`
+(`ok notify: unconfirmed (delivery not verified): ...`), and a job with no
+notify target reports `notify: n/a`, not a failure.
 `run --wait` exits with the job's exit code (124 on timeout). `kill` refuses
 unless the job is running or lost (exit 2) and signals the group only when
 the leader's start time still matches; when the leader is gone or reused it
@@ -96,20 +107,24 @@ are `usage`, `not_found`, `running`, `not_running` and `failed`. Shapes:
   "created_at","notify_target","notify_warning","heartbeat_ms",
   "heartbeat_fixed","heartbeat_current_ms","heartbeat","read_hint","wait"}`
   (`wait` is null, or `{"wait_ms","timed_out","state","exit_code","output"}`).
+  `command_string` is POSIX shell-quoted.
 - `list --json`: lines of `{"id","name","state","exit","exit_code","cmd",
   "command","heartbeats","created_ms","created_at","done_ms","done_at",
-  "duration_ms"}` (`state` includes `lost`).
+  "duration_ms"}` (`state` includes `lost`; `list --all --json` adds `owner`).
 - `show --json`: the job plus `notify_*`, `heartbeat_ms`, `heartbeat_fixed`,
-  `heartbeat_current_ms`, `heartbeats`, `output` (sanitised), `lines`,
-  `line_count`, `truncated`, `pgid` and ISO dates (`state` includes `lost`).
+  `heartbeat_current_ms`, `heartbeats`, `heartbeats_sent`,
+  `heartbeats_skipped_backoff`, `heartbeats_skipped_busy`, `heartbeats_failed`,
+  `output` (sanitised), `lines`, `line_count`, `truncated`, `pgid` and ISO
+  dates (`state` includes `lost`).
 - `tail --json`: `{"id","lines_requested","line_count","output","lines",
   "truncated"}` (output sanitised).
 - `check --json`: `{"id","state","exit_code","checks","pass","total",
-  "success",...}` with `notify_outcome`, `progress_notify` and `truncated`
-  (`state` includes `lost`).
+  "success",...}` with `notify_outcome`, `progress_notify`, `heartbeats_*`
+  and `truncated` (`state` includes `lost`).
 - `kill --json`: `{"id","state","signalled","detail","done_ms","done_at"}`
   (`state` is `killed` or `lost`).
-- `clean --json`: `{"removed","removed_ids"}` (removes finished and `lost`).
+- `clean --json`: `{"removed","removed_ids","skipped_other_owner"}` (removes
+  finished and `lost`; default is your own jobs, `--all` is every job).
 
 Run `agent-shell <command> --help` before you first use a command.
 
