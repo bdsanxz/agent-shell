@@ -37,6 +37,11 @@ agent-shell kill sh-1234-5678
 agent-shell clean --older-than 7d
 ```
 
+`run --name` keeps the given name as-is when it is valid kebab-case
+(letters, digits and single hyphens, up to 48 chars, case is kept);
+anything else is sanitised to that shape. `show`, `tail`, `check` and `kill`
+take the job id or name, case-insensitive (newest wins when names repeat);
+an unknown job lists the available ids and names in its hint.
 `run` validates `--cwd` and the executable up front (exit 2, no job created),
 then returns at once with a job id and exits: the command keeps running in
 background under a detached supervisor as the leader of its own process group

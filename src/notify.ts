@@ -494,6 +494,11 @@ export function notify(target: string, text: string, opts?: { ifIdle?: boolean }
   return fallback;
 }
 
+/** Strip a leading `hcx:` prefix from raw CLI output so warnings read cleanly. */
+function stripHcxPrefix(s: string): string {
+  return s.replace(/^hcx:\s*/i, "").trim();
+}
+
 /** Warn when hcx cannot find an explicit `--notify` target. Returns the
  * warning line, or null when the target looks fine. Never fails the run:
  * the completion notify still reports the real result. */
@@ -504,10 +509,18 @@ export function checkNotifyTarget(explicit: string | undefined): string | null {
   if (!support.ok) return null;
   if (haveHerdr()) return null;
   try {
-    const p = spawnSync("hcx", ["get", target], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 8000 });
+    const p = spawnSync("hcx", ["get", "--json", target], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 8000 });
     if (p.status === 0) return null;
     const parsed = parseHcxError((p.stdout as string) ?? "", (p.stderr as string) ?? "");
-    const msg = parsed !== null && parsed.message !== "" ? parsed.message : (((p.stderr as string) ?? "").trim().split("\n")[0] ?? "");
+    let msg = parsed !== null && parsed.message !== "" ? parsed.message : "";
+    if (msg === "") {
+      const rawErr = (((p.stderr as string) ?? "").trim().split("\n")[0] ?? "").trim();
+      const rawOut = (((p.stdout as string) ?? "").trim().split("\n")[0] ?? "").trim();
+      const raw = rawErr !== "" ? rawErr : rawOut;
+      msg = stripHcxPrefix(raw);
+    } else {
+      msg = stripHcxPrefix(msg);
+    }
     const why = msg === "" ? `exit ${p.status}` : msg;
     return `warning: hcx cannot find notify target "${target}" (${why}); the job still runs and the completion notify will report it`;
   } catch {

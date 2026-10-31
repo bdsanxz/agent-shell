@@ -86,7 +86,9 @@ Examples:
 
 Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] [--heartbeat-fixed] [--wait <duration>] [--json] -- <command...>
 
-  --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
+  --name <name>      Short job name (kebab-case, e.g. build, test-e2e; case is kept).
+                     Default: job. show, tail, check and kill take the job id
+                     or name (case-insensitive; newest wins when names repeat).
   --notify <target>  Who gets the notify turns: a herdr agent name, pane id, hc terminal
                      or tab name (hcx resolves tab names). Notified over the old herdr
                      server when it runs, else via \`hcx send --agent-only --no-footer
@@ -139,9 +141,11 @@ With --json, stdout is JSON lines (this command keeps that shape, as documented)
 (list --all adds "owner").`,
   show: `agent-shell show — show one job: status plus the tail of its output
 
-Usage: agent-shell show <id> [--tail <n>] [--json]
+Usage: agent-shell show <id|name> [--tail <n>] [--json]
 
   --tail <n>   Output lines to include. Default: 30.
+
+Takes the job id or name (case-insensitive; newest wins when names repeat).
 
 States are running, done, failed, killed and lost. Output is sanitised
 (CR progress bars collapsed, ANSI and control bytes stripped; the stored
@@ -160,7 +164,7 @@ command_string is POSIX shell-quoted (copy-paste reruns the same command).
 Heartbeats print as: heartbeats sent S (deferred D), skipped K (backoff B, busy U), failed F.`,
   tail: `agent-shell tail — print the tail of one job's output
 
-Usage: agent-shell tail <id> [--lines <n>] [--json]
+Usage: agent-shell tail <id|name> [--lines <n>] [--json]
 
   --lines <n>   Lines to print. Default: 50.
 
@@ -171,7 +175,7 @@ With --json, stdout is one JSON object (no prose):
 {"id","lines_requested","line_count","output","lines","truncated"}.`,
   check: `agent-shell check — verify one finished job before using its result
 
-Usage: agent-shell check <id> [--json]
+Usage: agent-shell check <id|name> [--json]
 
 Prints one line per record check with its concrete value, then a summary
 line, then a success line (the job's own outcome, separate from the records):
@@ -206,7 +210,7 @@ as "ok notify: unconfirmed (delivery not verified)". A timed-out completion
 heartbeat 10s timeouts).`,
   kill: `agent-shell kill — stop a running job (process group SIGTERM, then SIGKILL)
 
-Usage: agent-shell kill <id> [--json]
+Usage: agent-shell kill <id|name> [--json]
 
 Refuses with exit 2 unless the job state is running or lost, leaving a finished
 job's result untouched. The job runs as its own process group: kill signals
@@ -427,13 +431,14 @@ function cmdShow(argv: string[]): number {
     console.log(HELP["show"]);
     return 0;
   }
-  const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1)
+  const ref = p.positionals[0];
+  if (!ref || p.positionals.length !== 1)
     throw new UsageError("show needs exactly one <id>", "usage", "run agent-shell show --help for usage");
   const tail = parseCount(str(p, "tail"), 30, "tail");
-  const dir = jobDir(stateRoot(), id);
-  const meta = readMeta(dir);
-  if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
+  const root = stateRoot();
+  const found = resolveJob(root, ref);
+  if (!found) throw new UsageError(`unknown job ${ref}`, "not_found", notFoundHint(root));
+  const { dir, meta } = found;
   const status = readStatus(dir);
   const state = effectiveState(meta, status);
   const hbBase = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
@@ -523,12 +528,15 @@ function cmdTail(argv: string[]): number {
     console.log(HELP["tail"]);
     return 0;
   }
-  const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1)
+  const ref = p.positionals[0];
+  if (!ref || p.positionals.length !== 1)
     throw new UsageError("tail needs exactly one <id>", "usage", "run agent-shell tail --help for usage");
   const lines = parseCount(str(p, "lines"), 50, "lines");
-  const dir = jobDir(stateRoot(), id);
-  if (!readMeta(dir)) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
+  const root = stateRoot();
+  const found = resolveJob(root, ref);
+  if (!found) throw new UsageError(`unknown job ${ref}`, "not_found", notFoundHint(root));
+  const { dir } = found;
+  const id = found.meta.id;
   const raw = readTailDetailed(dir, lines);
   const out = sanitiseOutput(raw.text);
   if (wantsJson(p)) {
@@ -548,12 +556,14 @@ function cmdCheck(argv: string[]): number {
     console.log(HELP["check"]);
     return 0;
   }
-  const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1)
+  const ref = p.positionals[0];
+  if (!ref || p.positionals.length !== 1)
     throw new UsageError("check needs exactly one <id>", "usage", "run agent-shell check --help for usage");
-  const dir = jobDir(stateRoot(), id);
-  const meta = readMeta(dir);
-  if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
+  const root = stateRoot();
+  const found = resolveJob(root, ref);
+  if (!found) throw new UsageError(`unknown job ${ref}`, "not_found", notFoundHint(root));
+  const { dir, meta } = found;
+  const id = meta.id;
   const status = readStatus(dir);
   const state = effectiveState(meta, status);
   if (state === "running")
@@ -731,12 +741,14 @@ function cmdKill(argv: string[]): number {
     console.log(HELP["kill"]);
     return 0;
   }
-  const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1)
+  const ref = p.positionals[0];
+  if (!ref || p.positionals.length !== 1)
     throw new UsageError("kill needs exactly one <id>", "usage", "run agent-shell kill --help for usage");
-  const dir = jobDir(stateRoot(), id);
-  const meta = readMeta(dir);
-  if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
+  const root = stateRoot();
+  const found = resolveJob(root, ref);
+  if (!found) throw new UsageError(`unknown job ${ref}`, "not_found", notFoundHint(root));
+  const { dir, meta } = found;
+  const id = meta.id;
   const status = readStatus(dir);
   const state = effectiveState(meta, status);
   if (state !== "running" && state !== "lost")
@@ -1105,13 +1117,60 @@ function buildHeartbeatText(name: string, elapsedMs: number, last: string, id: s
 }
 
 function sanitizeName(name: string): string {
-  let out = name
+  const raw = name.trim();
+  if (/^[A-Za-z0-9][A-Za-z0-9-]{0,47}$/.test(raw) && !raw.includes("--") && !raw.endsWith("-")) return raw;
+  let out = raw
     .split("")
-    .map((c) => (/[A-Za-z0-9]/.test(c) ? c.toLowerCase() : "-"))
+    .map((c) => (/[A-Za-z0-9]/.test(c) ? c : "-"))
     .join("");
   while (out.includes("--")) out = out.replaceAll("--", "-");
   out = out.replace(/^-+|-+$/g, "").slice(0, 48);
   return out === "" ? "job" : out;
+}
+
+/** Resolve a job reference (id or name, case-insensitive) to its directory
+ * and meta. Exact id directory first, then exact name/id, then a
+ * case-insensitive name/id match (newest wins). One place for every
+ * job-taking command. */
+function resolveJob(root: string, ref: string): { dir: string; meta: Meta } | null {
+  const exactDir = jobDir(root, ref);
+  const exactMeta = readMeta(exactDir);
+  if (exactMeta) return { dir: exactDir, meta: exactMeta };
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(jobsDir(root), { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const lower = ref.toLowerCase();
+  const candidates: { dir: string; meta: Meta; exactCase: boolean }[] = [];
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const d = path.join(jobsDir(root), e.name);
+    const m = readMeta(d);
+    if (!m) continue;
+    if (m.id === ref || m.name === ref) candidates.push({ dir: d, meta: m, exactCase: true });
+    else if (m.id.toLowerCase() === lower || m.name.toLowerCase() === lower)
+      candidates.push({ dir: d, meta: m, exactCase: false });
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => Number(b.exactCase) - Number(a.exactCase) || b.meta.created_ms - a.meta.created_ms);
+  return { dir: candidates[0]!.dir, meta: candidates[0]!.meta };
+}
+
+/** not_found hint listing available jobs (ids with names). */
+function notFoundHint(root: string): string {
+  const base = "run agent-shell list to see job ids";
+  try {
+    const jobs = allJobs(root).slice(0, 5);
+    if (jobs.length === 0) return base;
+    const names = jobs
+      .map(({ meta }) => (meta.name && meta.name !== meta.id ? `${meta.id} (${meta.name})` : meta.id))
+      .join(", ");
+    return `${base} (available: ${names})`;
+  } catch {
+    return base;
+  }
 }
 
 function resolveExecutable(cmd: string): string | null {
@@ -1347,11 +1406,11 @@ function cmdSupervise(argv: string[]): Promise<number> {
   return supervise(id);
 }
 
-async function supervise(id: string): Promise<number> {
+async function supervise(ref: string): Promise<number> {
   const root = stateRoot();
-  const dir = jobDir(root, id);
-  const meta = readMeta(dir);
-  if (!meta) throw new Error(`unknown job ${id}`);
+  const found = resolveJob(root, ref);
+  if (!found) throw new Error(`unknown job ${ref}`);
+  const { dir, meta } = found;
   meta.supervisor_pid = process.pid;
   meta.supervisor_lstart = procStartTime(process.pid);
   writeMeta(dir, meta);
