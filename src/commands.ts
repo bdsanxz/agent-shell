@@ -3,7 +3,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { UsageError, bool, parseArgs, str, unknownFlags } from "./args.ts";
+import { UsageError, bool, parseArgs, str, unknownFlags, type Parsed } from "./args.ts";
 import { checkNotifyTarget, currentOwner, defaultTarget, notify, type NotifyResult } from "./notify.ts";
 import {
   defaultHeartbeatMs,
@@ -64,7 +64,7 @@ Examples:
   agent-shell show sh-1234-5678`,
   run: `agent-shell run — start a command in background, return its job id at once
 
-Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] -- <command...>
+Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] [--wait <duration>] [--json] -- <command...>
 
   --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
   --notify <target>  Who gets the notify turns: a herdr agent name, pane id, hc terminal
@@ -81,26 +81,46 @@ Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--hear
                      (124 on timeout). Default: do not wait.
   <command...>       The command to run (after \`--\`); use \`sh -c '...'\` for shell features.
 
-Prints the job id and the notify target, then exits at once unless --wait is given.`,
+Prints the job id and the notify target, then exits at once unless --wait is given.
+
+With --json, stdout is one JSON object (no table, no prose):
+{"id","name","command","command_string","cwd","created_ms","created_at",
+"notify_target","notify_warning","heartbeat_ms","read_hint","wait"}
+"wait" is null without --wait, else {"wait_ms","timed_out","state",
+"exit_code","output"}.`,
   list: `agent-shell list — list jobs (running first, then newest done)
 
 Usage: agent-shell list [--all] [--json]
 
   --all    Include all finished jobs (default: running plus the 20 newest).
-  --json   Machine-readable JSON lines instead of the table.`,
+  --json   Machine-readable JSON lines instead of the table (one object per line).
+
+With --json, stdout is JSON lines (this command keeps that shape, as documented):
+{"id","name","state","exit","exit_code","cmd","command","heartbeats",
+"created_ms","created_at","done_ms","done_at","duration_ms"}.`,
   show: `agent-shell show — show one job: status plus the tail of its output
 
-Usage: agent-shell show <id> [--tail <n>]
+Usage: agent-shell show <id> [--tail <n>] [--json]
 
-  --tail <n>   Output lines to include. Default: 30.`,
+  --tail <n>   Output lines to include. Default: 30.
+
+With --json, stdout is one JSON object (no prose):
+{"id","name","command","command_string","cwd","created_ms","created_at",
+"state","exit_code","duration_ms","done_ms","done_at","error",
+"notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
+"heartbeat_ms","heartbeats","last_heartbeat_ms","last_heartbeat_at",
+"last_heartbeat_detail","tail_lines_requested","output","line_count"}.`,
   tail: `agent-shell tail — print the tail of one job's output
 
-Usage: agent-shell tail <id> [--lines <n>]
+Usage: agent-shell tail <id> [--lines <n>] [--json]
 
-  --lines <n>   Lines to print. Default: 50.`,
+  --lines <n>   Lines to print. Default: 50.
+
+With --json, stdout is one JSON object (no prose):
+{"id","lines_requested","line_count","output","lines"}.`,
   check: `agent-shell check — verify one finished job before using its result
 
-Usage: agent-shell check <id>
+Usage: agent-shell check <id> [--json]
 
 Prints one line per record check with its concrete value, then a summary
 line, then a success line (the job's own outcome, separate from the records):
@@ -119,22 +139,33 @@ the finished check: its output is partial and it never got a completion
 notify. A job with no notify target prints "ok notify: n/a" (not a failure).
 
 When progress notifies were sent, the last one prints as \`progress notify: ...\`
-after the notify line. It is informational and does not change the pass count.`,
+after the notify line. It is informational and does not change the pass count.
+
+With --json, stdout is one JSON object (no prose) with the same exit codes:
+{"id","state","exit_code","output_lines","output_ok","output_detail",
+"notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
+"notify_ok","progress_notify","checks","pass","total","success","success_detail"}.`,
   kill: `agent-shell kill — stop a running job (SIGTERM, then SIGKILL)
 
-Usage: agent-shell kill <id>
+Usage: agent-shell kill <id> [--json]
 
 Refuses with exit 2 unless the job state is running, leaving a finished
 job's result untouched. The child is only signalled when its process start
 time still matches the recorded start (no PID-reuse kill).
 
-A killed job gets no completion notify; its partial output stays readable.`,
+A killed job gets no completion notify; its partial output stays readable.
+
+With --json, stdout is one JSON object (no prose):
+{"id","state","signalled","detail"}.`,
   clean: `agent-shell clean — remove finished job directories
 
-Usage: agent-shell clean [--older-than <duration>]
+Usage: agent-shell clean [--older-than <duration>] [--json]
 
   --older-than <d>   Only remove jobs finished this long ago or more (e.g. 24h, 7d).
-                     Default: remove all finished jobs. Running jobs are never removed.`,
+                     Default: remove all finished jobs. Running jobs are never removed.
+
+With --json, stdout is one JSON object (no prose):
+{"removed","removed_ids"}.`,
   supervise: `agent-shell supervise — internal: supervise one job to completion, then notify
 
 Usage: agent-shell supervise <id>
@@ -161,7 +192,7 @@ export async function dispatch(cmd: string, argv: string[]): Promise<number> {
     case "supervise":
       return cmdSupervise(argv);
     default:
-      throw new UsageError(`unknown command "${cmd}"`);
+      throw new UsageError(`unknown command "${cmd}"`, "usage", "run agent-shell --help for the command list");
   }
 }
 
@@ -187,6 +218,19 @@ function allJobs(root: string): { meta: Meta; status: Status | null }[] {
   return out;
 }
 
+function wantsJson(p: Parsed): boolean {
+  return p.flags.has("json");
+}
+
+function iso(ms: number | null | undefined): string | null {
+  if (ms === null || ms === undefined) return null;
+  return new Date(ms).toISOString();
+}
+
+function printJson(obj: unknown): void {
+  console.log(JSON.stringify(obj));
+}
+
 function cmdList(argv: string[]): number {
   const p = parseArgs(argv, ["all", "json"]);
   unknownFlags(p, ["all", "json"]);
@@ -194,22 +238,28 @@ function cmdList(argv: string[]): number {
     console.log(HELP["list"]);
     return 0;
   }
-  if (p.positionals.length !== 0) throw new UsageError("list takes no arguments");
+  if (p.positionals.length !== 0)
+    throw new UsageError("list takes no arguments", "usage", "run agent-shell list --help for usage");
   const root = stateRoot();
   let jobs = allJobs(root);
   if (!bool(p, "all") && jobs.length > 20) jobs = jobs.slice(0, 20);
-  if (bool(p, "json")) {
+  if (wantsJson(p)) {
     for (const { meta, status } of jobs) {
-      console.log(
-        JSON.stringify({
-          id: meta.id,
-          name: meta.name,
-          state: status?.state ?? "running",
-          exit: status?.exit_code ?? null,
-          cmd: meta.command.join(" "),
-          heartbeats: status?.heartbeats ?? 0,
-        }),
-      );
+      printJson({
+        id: meta.id,
+        name: meta.name,
+        state: status?.state ?? "running",
+        exit: status?.exit_code ?? null,
+        exit_code: status?.exit_code ?? null,
+        cmd: meta.command.join(" "),
+        command: meta.command,
+        heartbeats: status?.heartbeats ?? 0,
+        created_ms: meta.created_ms,
+        created_at: iso(meta.created_ms),
+        done_ms: status?.done_ms ?? null,
+        done_at: iso(status?.done_ms ?? null),
+        duration_ms: status?.duration_ms ?? null,
+      });
     }
     return 0;
   }
@@ -228,26 +278,63 @@ function cmdList(argv: string[]): number {
 
 function parseCount(raw: string | undefined, def: number, flag: string): number {
   if (raw === undefined) return def;
-  if (!/^\d+$/.test(raw.trim())) throw new UsageError(`bad --${flag} '${raw}': needs a positive integer`);
+  if (!/^\d+$/.test(raw.trim()))
+    throw new UsageError(`bad --${flag} '${raw}': needs a positive integer`, "usage", `run agent-shell show --help for usage`);
   const n = parseInt(raw.trim(), 10);
-  if (!Number.isSafeInteger(n) || n < 1) throw new UsageError(`bad --${flag} '${raw}': needs a positive integer`);
+  if (!Number.isSafeInteger(n) || n < 1)
+    throw new UsageError(`bad --${flag} '${raw}': needs a positive integer`, "usage", `run agent-shell show --help for usage`);
   return n;
 }
 
 function cmdShow(argv: string[]): number {
-  const p = parseArgs(argv);
-  unknownFlags(p, ["tail"]);
+  const p = parseArgs(argv, ["json"]);
+  unknownFlags(p, ["tail", "json"]);
   if (bool(p, "help")) {
     console.log(HELP["show"]);
     return 0;
   }
   const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1) throw new UsageError("show needs exactly one <id>");
+  if (!id || p.positionals.length !== 1)
+    throw new UsageError("show needs exactly one <id>", "usage", "run agent-shell show --help for usage");
   const tail = parseCount(str(p, "tail"), 30, "tail");
   const dir = jobDir(stateRoot(), id);
   const meta = readMeta(dir);
-  if (!meta) throw new UsageError(`unknown job ${id}`);
+  if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
   const status = readStatus(dir);
+  if (wantsJson(p)) {
+    const out = tailLog(dir, tail);
+    const lines = out === "" ? [] : out.split("\n");
+    printJson({
+      id: meta.id,
+      name: meta.name,
+      command: meta.command,
+      command_string: meta.command.join(" "),
+      cwd: meta.cwd,
+      created_ms: meta.created_ms,
+      created_at: iso(meta.created_ms),
+      state: status?.state ?? "running",
+      exit_code: status?.exit_code ?? null,
+      duration_ms: status?.duration_ms ?? null,
+      done_ms: status?.done_ms ?? null,
+      done_at: iso(status?.done_ms ?? null),
+      error: status?.error ?? null,
+      notify_detail: status?.notify_detail ?? "",
+      notify_outcome: status?.notify_outcome ?? "",
+      notify_route: status?.notify_route ?? null,
+      notify_agent: status?.notify_agent ?? null,
+      notify_note: status?.notify_note ?? null,
+      heartbeat_ms: meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms,
+      heartbeats: status?.heartbeats ?? 0,
+      last_heartbeat_ms: status?.last_heartbeat_ms ?? null,
+      last_heartbeat_at: iso(status?.last_heartbeat_ms ?? null),
+      last_heartbeat_detail: status?.last_heartbeat_detail ?? "",
+      tail_lines_requested: tail,
+      output: out,
+      lines,
+      line_count: lines.length,
+    });
+    return 0;
+  }
   console.log(`job ${meta.id}`);
   console.log(`name ${meta.name}`);
   console.log(`command ${meta.command.join(" ")}`);
@@ -273,51 +360,57 @@ function cmdShow(argv: string[]): number {
 }
 
 function cmdTail(argv: string[]): number {
-  const p = parseArgs(argv);
-  unknownFlags(p, ["lines"]);
+  const p = parseArgs(argv, ["json"]);
+  unknownFlags(p, ["lines", "json"]);
   if (bool(p, "help")) {
     console.log(HELP["tail"]);
     return 0;
   }
   const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1) throw new UsageError("tail needs exactly one <id>");
+  if (!id || p.positionals.length !== 1)
+    throw new UsageError("tail needs exactly one <id>", "usage", "run agent-shell tail --help for usage");
   const lines = parseCount(str(p, "lines"), 50, "lines");
   const dir = jobDir(stateRoot(), id);
-  if (!readMeta(dir)) throw new UsageError(`unknown job ${id}`);
+  if (!readMeta(dir)) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
   const out = tailLog(dir, lines);
+  if (wantsJson(p)) {
+    const arr = out === "" ? [] : out.split("\n");
+    printJson({ id, lines_requested: lines, line_count: arr.length, output: out, lines: arr });
+    return 0;
+  }
   if (out !== "") console.log(out);
   return 0;
 }
 
 function cmdCheck(argv: string[]): number {
-  const p = parseArgs(argv);
-  unknownFlags(p, []);
+  const p = parseArgs(argv, ["json"]);
+  unknownFlags(p, ["json"]);
   if (bool(p, "help")) {
     console.log(HELP["check"]);
     return 0;
   }
   const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1) throw new UsageError("check needs exactly one <id>");
+  if (!id || p.positionals.length !== 1)
+    throw new UsageError("check needs exactly one <id>", "usage", "run agent-shell check --help for usage");
   const dir = jobDir(stateRoot(), id);
   const meta = readMeta(dir);
-  if (!meta) throw new UsageError(`unknown job ${id}`);
+  if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
   const status = readStatus(dir);
   const state = status?.state ?? "running";
   if (state === "running")
-    throw new UsageError(`job ${id} is still running; check it after its notify turn arrives`);
-  let pass = 0;
-  const line = (ok: boolean, text: string) => {
-    console.log(`${ok ? "ok" : "FAIL"} ${text}`);
-    if (ok) pass++;
-  };
-  line(
-    state === "done" || state === "failed",
+    throw new UsageError(
+      `job ${id} is still running; check it after its notify turn arrives`,
+      "running",
+      "wait for its notify turn, then run agent-shell check again",
+    );
+  const finishedOk = state === "done" || state === "failed";
+  const finishedDetail =
     state === "killed"
-      ? `finished: state is killed (partial output kept, no completion notify)`
-      : `finished: state is ${state}`,
-  );
+      ? "finished: state is killed (partial output kept, no completion notify)"
+      : `finished: state is ${state}`;
   const code = status?.exit_code;
-  line(code !== null && code !== undefined, code !== null && code !== undefined ? `exit: ${code}` : `exit: no exit code recorded`);
+  const exitOk = code !== null && code !== undefined;
+  const exitDetail = exitOk ? `exit: ${code}` : "exit: no exit code recorded";
   const logPath = path.join(dir, "output.log");
   let lines: string[] | null = null;
   try {
@@ -328,35 +421,80 @@ function cmdCheck(argv: string[]): number {
   } catch {
     lines = null;
   }
-  line(lines !== null, lines !== null ? `output: ${lines.length} lines` : `output: output.log is missing or unreadable`);
+  const outputOk = lines !== null;
+  const outputDetail = outputOk ? `output: ${lines!.length} lines` : "output: output.log is missing or unreadable";
   const detail = status?.notify_detail ?? "";
   const noTarget = detail.includes("no notify target") || (meta.notify_target ?? "") === "";
+  let notifyOk: boolean;
+  let notifyDetail: string;
   if (noTarget) {
-    line(true, `notify: n/a (no notify target)`);
+    notifyOk = true;
+    notifyDetail = "notify: n/a (no notify target)";
   } else {
     const outcome = status?.notify_outcome ?? "";
     const okOutcome = outcome === "delivered" || outcome === "unconfirmed";
     if (outcome !== "") {
-      line(okOutcome, okOutcome ? `notify: ${detail}` : `notify: not delivered [${outcome}] (${detail || "no notify recorded"})`);
+      notifyOk = okOutcome;
+      notifyDetail = okOutcome ? `notify: ${detail}` : `notify: not delivered [${outcome}] (${detail || "no notify recorded"})`;
     } else {
       const notified = status?.notified === true;
-      line(notified, notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`);
+      notifyOk = notified;
+      notifyDetail = notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`;
     }
   }
-  // The last progress notify is informational: a failure here is visible, but only
-  // the completion notify decides whether the job's result is trusted.
   const lastProgress = status?.last_heartbeat_detail ?? "";
-  if (lastProgress !== "") console.log(`progress notify: ${lastProgress}`);
-  console.log(`check ${id}: ${pass}/4 pass`);
+  const checks = [
+    { name: "finished", ok: finishedOk, detail: finishedDetail },
+    { name: "exit", ok: exitOk, detail: exitDetail },
+    { name: "output", ok: outputOk, detail: outputDetail },
+    { name: "notify", ok: notifyOk, detail: notifyDetail },
+  ];
+  const pass = checks.filter((c) => c.ok).length;
   const success = state === "done" && code === 0;
-  if (success) {
-    console.log(`ok success: exit 0`);
-  } else if (code === null || code === undefined) {
-    console.log(`FAIL success: state is ${state} with no exit code`);
-  } else {
-    console.log(`FAIL success: exit ${code} (state is ${state})`);
+  const successDetail =
+    success
+      ? "ok success: exit 0"
+      : code === null || code === undefined
+        ? `FAIL success: state is ${state} with no exit code`
+        : `FAIL success: exit ${code} (state is ${state})`;
+  const exitCode = pass === 4 && success ? 0 : 1;
+  if (wantsJson(p)) {
+    printJson({
+      id,
+      state,
+      exit_code: code ?? null,
+      output_lines: lines === null ? null : lines.length,
+      output_ok: outputOk,
+      output_detail: outputDetail,
+      notify_detail: detail,
+      notify_outcome: status?.notify_outcome ?? "",
+      notify_route: status?.notify_route ?? null,
+      notify_agent: status?.notify_agent ?? null,
+      notify_note: status?.notify_note ?? null,
+      notify_ok: notifyOk,
+      notify_detail_line: notifyDetail,
+      progress_notify: lastProgress,
+      checks,
+      pass,
+      total: 4,
+      success,
+      success_detail: successDetail,
+    });
+    return exitCode;
   }
-  return pass === 4 && success ? 0 : 1;
+  let humanPass = 0;
+  const line = (ok: boolean, text: string) => {
+    console.log(`${ok ? "ok" : "FAIL"} ${text}`);
+    if (ok) humanPass++;
+  };
+  line(finishedOk, finishedDetail);
+  line(exitOk, exitDetail);
+  line(outputOk, outputDetail);
+  line(notifyOk, notifyDetail);
+  if (lastProgress !== "") console.log(`progress notify: ${lastProgress}`);
+  console.log(`check ${id}: ${humanPass}/4 pass`);
+  console.log(successDetail);
+  return exitCode;
 }
 
 /** `ps -o lstart` for a pid, or null when the process is gone/unreadable. */
@@ -393,20 +531,26 @@ function pidMatches(pid: number, stored: string | null | undefined): boolean {
 }
 
 function cmdKill(argv: string[]): number {
-  const p = parseArgs(argv);
-  unknownFlags(p, []);
+  const p = parseArgs(argv, ["json"]);
+  unknownFlags(p, ["json"]);
   if (bool(p, "help")) {
     console.log(HELP["kill"]);
     return 0;
   }
   const id = p.positionals[0];
-  if (!id || p.positionals.length !== 1) throw new UsageError("kill needs exactly one <id>");
+  if (!id || p.positionals.length !== 1)
+    throw new UsageError("kill needs exactly one <id>", "usage", "run agent-shell kill --help for usage");
   const dir = jobDir(stateRoot(), id);
   const meta = readMeta(dir);
-  if (!meta) throw new UsageError(`unknown job ${id}`);
+  if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
   const status = readStatus(dir);
   const state = status?.state ?? "running";
-  if (state !== "running") throw new UsageError(`job ${id} is not running (state is ${state}); refusing to kill a finished job`);
+  if (state !== "running")
+    throw new UsageError(
+      `job ${id} is not running (state is ${state}); refusing to kill a finished job`,
+      "not_running",
+      "use agent-shell show to read its result",
+    );
   let killed = false;
   const targets: Array<{ pid: number | null | undefined; stored: string | null | undefined }> = [
     { pid: meta.child_pid, stored: meta.child_lstart },
@@ -455,13 +599,15 @@ function cmdKill(argv: string[]): number {
     }
   }
   const prev = readStatus(dir);
+  const doneMs = nowMs();
+  const detail = killed ? "killed by user; no completion notify" : "no live process found";
   writeStatus(dir, {
     state: "killed",
     exit_code: null,
-    done_ms: nowMs(),
+    done_ms: doneMs,
     duration_ms: null,
     notified: false,
-    notify_detail: killed ? "killed by user; no completion notify" : "no live process found",
+    notify_detail: detail,
     notify_outcome: "",
     notify_route: null,
     notify_agent: null,
@@ -471,22 +617,28 @@ function cmdKill(argv: string[]): number {
     last_heartbeat_detail: prev?.last_heartbeat_detail ?? "",
     error: prev?.error ?? null,
   });
+  if (wantsJson(p)) {
+    printJson({ id, state: "killed", signalled: killed, detail, done_ms: doneMs, done_at: iso(doneMs) });
+    return 0;
+  }
   console.log(`killed ${id}`);
   return 0;
 }
 
 function cmdClean(argv: string[]): number {
-  const p = parseArgs(argv);
-  unknownFlags(p, ["older-than"]);
+  const p = parseArgs(argv, ["json"]);
+  unknownFlags(p, ["older-than", "json"]);
   if (bool(p, "help")) {
     console.log(HELP["clean"]);
     return 0;
   }
-  if (p.positionals.length !== 0) throw new UsageError("clean takes no arguments");
+  if (p.positionals.length !== 0)
+    throw new UsageError("clean takes no arguments", "usage", "run agent-shell clean --help for usage");
   const root = stateRoot();
   const older = str(p, "older-than");
   const cutoff = older !== undefined ? nowMs() - parseDurationMs(older) : null;
   let removed = 0;
+  const removedIds: string[] = [];
   for (const { meta, status } of allJobs(root)) {
     if ((status?.state ?? "running") === "running") continue;
     if (cutoff !== null) {
@@ -495,6 +647,11 @@ function cmdClean(argv: string[]): number {
     }
     fs.rmSync(jobDir(root, meta.id), { recursive: true, force: true });
     removed++;
+    removedIds.push(meta.id);
+  }
+  if (wantsJson(p)) {
+    printJson({ removed, removed_ids: removedIds });
+    return 0;
   }
   console.log(`removed ${removed} jobs`);
   return 0;
@@ -502,7 +659,7 @@ function cmdClean(argv: string[]): number {
 
 function parseDurationMs(s: string): number {
   const m = s.match(/^(\d+)(ms|s|m|h|d)?$/);
-  if (!m) throw new UsageError(`bad duration '${s}': use like 24h, 7d, 30m`);
+  if (!m) throw new UsageError(`bad duration '${s}': use like 24h, 7d, 30m`, "usage", "use a number with ms, s, m, h or d");
   const v = parseInt(m[1]!, 10);
   const unit = m[2] ?? "s";
   const mult: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
@@ -517,7 +674,7 @@ function parseHeartbeatMs(raw: string | undefined, disabled: boolean): number | 
   if (v === "" || v === "off" || v === "no" || v === "none" || v === "never" || v === "disabled") return null;
   const ms = parseDurationMs(raw.trim());
   if (ms === 0) return null;
-  if (ms < 1000) throw new UsageError(`bad --heartbeat '${raw}': minimum is 1s`);
+  if (ms < 1000) throw new UsageError(`bad --heartbeat '${raw}': minimum is 1s`, "usage", "use off to disable or at least 1s");
   return ms;
 }
 
@@ -589,26 +746,28 @@ function resolveExecutable(cmd: string): string | null {
 }
 
 async function cmdRun(argv: string[]): Promise<number> {
-  const p = parseArgs(argv, ["no-heartbeat"]);
-  unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat", "wait"]);
+  const p = parseArgs(argv, ["no-heartbeat", "json"]);
+  unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat", "wait", "json"]);
   if (bool(p, "help")) {
     console.log(HELP["run"]);
     return 0;
   }
-  if (p.positionals.length === 0) throw new UsageError("run needs a command after `--`");
+  if (p.positionals.length === 0)
+    throw new UsageError("run needs a command after `--`", "usage", "run agent-shell run -- -- <command> for usage");
   const heartbeatMs = parseHeartbeatMs(str(p, "heartbeat"), bool(p, "no-heartbeat"));
   const waitRaw = str(p, "wait");
   const waitMs = waitRaw === undefined ? undefined : parseDurationMs(waitRaw.trim());
   const cwd = str(p, "cwd") ?? process.cwd();
   try {
     const st = fs.statSync(cwd);
-    if (!st.isDirectory()) throw new UsageError(`bad --cwd '${cwd}': not a directory`);
+    if (!st.isDirectory()) throw new UsageError(`bad --cwd '${cwd}': not a directory`, "usage", "use a directory that exists");
   } catch (e) {
     if (e instanceof UsageError) throw e;
-    throw new UsageError(`bad --cwd '${cwd}': no such directory`);
+    throw new UsageError(`bad --cwd '${cwd}': no such directory`, "not_found", "use a directory that exists");
   }
   const exe = p.positionals[0]!;
-  if (resolveExecutable(exe) === null) throw new UsageError(`cannot start '${exe}': executable not found on PATH`);
+  if (resolveExecutable(exe) === null)
+    throw new UsageError(`cannot start '${exe}': executable not found on PATH`, "not_found", "check the command name or install it");
   const root = stateRoot();
   const id = freshId(root);
   const dir = jobDir(root, id);
@@ -648,17 +807,41 @@ async function cmdRun(argv: string[]): Promise<number> {
   });
   fs.writeFileSync(path.join(dir, "output.log"), "");
   spawnSupervisor(id);
-  console.log(`job ${id}`);
-  if (target === "") {
-    console.log(`notify skipped (no herdr pane and no --notify); read with: agent-shell show ${id}`);
-  } else {
-    console.log(`notify ${target}`);
-  }
   const notifyWarning = checkNotifyTarget(str(p, "notify"));
-  if (notifyWarning !== null) console.log(notifyWarning);
-  console.log(`heartbeat ${heartbeatMs === null ? "off" : `every ${formatElapsed(heartbeatMs)}`}`);
-  console.log(`read with: agent-shell show ${id}`);
-  if (waitMs === undefined) return 0;
+  const heartbeatLabel = heartbeatMs === null ? "off" : `every ${formatElapsed(heartbeatMs)}`;
+  const readHint = `agent-shell show ${id}`;
+  const json = wantsJson(p);
+  if (!json) {
+    console.log(`job ${id}`);
+    if (target === "") {
+      console.log(`notify skipped (no herdr pane and no --notify); read with: agent-shell show ${id}`);
+    } else {
+      console.log(`notify ${target}`);
+    }
+    if (notifyWarning !== null) console.log(notifyWarning);
+    console.log(`heartbeat ${heartbeatLabel}`);
+    console.log(`read with: ${readHint}`);
+  }
+  if (waitMs === undefined) {
+    if (json) {
+      printJson({
+        id,
+        name: meta.name,
+        command: meta.command,
+        command_string: meta.command.join(" "),
+        cwd,
+        created_ms: meta.created_ms,
+        created_at: iso(meta.created_ms),
+        notify_target: target,
+        notify_warning: notifyWarning,
+        heartbeat_ms: heartbeatMs,
+        heartbeat: heartbeatLabel,
+        read_hint: readHint,
+        wait: null,
+      });
+    }
+    return 0;
+  }
   const deadline = Date.now() + waitMs;
   let status = readStatus(dir);
   while ((status?.state ?? "running") === "running" && Date.now() < deadline) {
@@ -666,15 +849,58 @@ async function cmdRun(argv: string[]): Promise<number> {
     status = readStatus(dir);
   }
   if ((status?.state ?? "running") === "running") {
+    if (json) {
+      printJson({
+        id,
+        name: meta.name,
+        command: meta.command,
+        command_string: meta.command.join(" "),
+        cwd,
+        created_ms: meta.created_ms,
+        created_at: iso(meta.created_ms),
+        notify_target: target,
+        notify_warning: notifyWarning,
+        heartbeat_ms: heartbeatMs,
+        heartbeat: heartbeatLabel,
+        read_hint: readHint,
+        wait: { wait_ms: waitMs, timed_out: true, state: "running", exit_code: null, output: "" },
+      });
+      return 124;
+    }
     console.log(`still running after ${formatElapsed(waitMs)}; read with: agent-shell show ${id}`);
     return 124;
   }
   const out = tailLog(dir, 30);
+  const code = status?.exit_code;
+  const finalCode =
+    typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255 ? code : 1;
+  if (json) {
+    printJson({
+      id,
+      name: meta.name,
+      command: meta.command,
+      command_string: meta.command.join(" "),
+      cwd,
+      created_ms: meta.created_ms,
+      created_at: iso(meta.created_ms),
+      notify_target: target,
+      notify_warning: notifyWarning,
+      heartbeat_ms: heartbeatMs,
+      heartbeat: heartbeatLabel,
+      read_hint: readHint,
+      wait: {
+        wait_ms: waitMs,
+        timed_out: false,
+        state: status?.state ?? "running",
+        exit_code: code ?? null,
+        output: out,
+      },
+    });
+    return finalCode;
+  }
   if (out.trim() !== "") console.log(`--- output (last 30 lines) ---\n${out}`);
   console.log(`exit ${status?.exit_code ?? "?"}`);
-  const code = status?.exit_code;
-  if (typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255) return code;
-  return 1;
+  return finalCode;
 }
 
 /** Detach `supervise <id>`: stdio ignored, new session, no wait. */

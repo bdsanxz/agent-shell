@@ -13,10 +13,16 @@ if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") {
   process.exit(cmd ? 0 : 2);
 }
 const label = cmd;
+const wantsJsonErr = process.argv.slice(2).some((a) => a === "--json" || a.startsWith("--json="));
+function jsonError(kind: string, message: string, hint?: string): void {
+  const error: Record<string, string> = { kind, message };
+  if (hint !== undefined && hint !== "") error["hint"] = hint;
+  console.log(JSON.stringify({ error }));
+}
 try {
   if (rest.includes("--help") && rest.length === 1) {
     const text = HELP[cmd];
-    if (!text) throw new UsageError(`unknown command "${cmd}"`);
+    if (!text) throw new UsageError(`unknown command "${cmd}"`, "usage", "run agent-shell --help for the command list");
     console.log(text);
     process.exit(0);
   }
@@ -24,10 +30,20 @@ try {
 } catch (e) {
   const msg = e instanceof Error ? e.message : String(e);
   if (e instanceof UsageError) {
-    console.error(`agent-shell ${label}: ${msg}\nRun \`agent-shell ${label} --help\` for usage.`);
-    process.exitCode = 2;
+    if (wantsJsonErr) {
+      jsonError(e.kind ?? "usage", msg, e.hint);
+      process.exitCode = 2;
+    } else {
+      console.error(`agent-shell ${label}: ${msg}\nRun \`agent-shell ${label} --help\` for usage.`);
+      process.exitCode = 2;
+    }
   } else {
-    console.error(`agent-shell ${label}: ${msg}`);
-    process.exitCode = 1;
+    if (wantsJsonErr) {
+      jsonError("failed", msg);
+      process.exitCode = 1;
+    } else {
+      console.error(`agent-shell ${label}: ${msg}`);
+      process.exitCode = 1;
+    }
   }
 }

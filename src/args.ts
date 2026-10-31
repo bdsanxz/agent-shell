@@ -1,6 +1,14 @@
 // A small argument reader: `--flag value`, `--flag=value`, boolean flags, `--` and positionals.
 
-export class UsageError extends Error {}
+export class UsageError extends Error {
+  kind: string;
+  hint?: string;
+  constructor(message: string, kind = "usage", hint?: string) {
+    super(message);
+    this.kind = kind;
+    if (hint !== undefined) this.hint = hint;
+  }
+}
 
 export interface Parsed {
   positionals: string[];

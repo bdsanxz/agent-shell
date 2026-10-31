@@ -9,8 +9,21 @@ curl -fsSL https://raw.githubusercontent.com/bdsanxz/agent-shell/main/install.sh
 ```
 
 It downloads the release's `agent-shell.js` (one bundled file that runs with Bun, no
-compile step), checks its SHA-256, and puts it in `~/.local/bin/agent-shell`.
+compile step), checks its SHA-256 against the release's `agent-shell.js.sha256`,
+and puts it in `~/.local/bin/agent-shell`.
 `agent-shell` needs [Bun](https://bun.sh) on `PATH`.
+
+```sh
+install.sh [--version vX.Y.Z] [--dir DIR] [--force]
+```
+
+`--version` picks the release (default `latest`, env `AGENT_SHELL_VERSION`);
+`--dir` picks the install directory (default `~/.local/bin`, env
+`AGENT_SHELL_INSTALL_DIR`); `--force` replaces a symlinked target (a local
+dev install is left alone without it). The token for a private repository
+never appears on a command line: the public URL is tried first, and only
+after a 404 is `GITHUB_TOKEN` (else `gh auth token`) passed through a curl
+stdin config. The checksum uses `sha256sum`, else `shasum -a 256`.
 
 ## Use
 
@@ -52,6 +65,29 @@ only for `delivered` or `unconfirmed`, and a job with no notify target
 reports `notify: n/a`, not a failure. `run --wait` exits with the job's exit
 code (124 on timeout). `kill` refuses unless the job is running (exit 2) and
 only signals the child when its start time still matches.
+
+Every command takes `--json`: stdout is exactly one JSON document (no table,
+no prose, no color), with stable `snake_case` fields covering the human view
+(ids, states, exit codes, ISO timestamps, counts, notify outcome and hints).
+`list --json` keeps its JSON-lines shape (one object per line). Errors with
+`--json` print `{"error":{"kind":...,"message":...,"hint":...}}` on stdout
+with the same exit codes; human stderr appears only without `--json`. Kinds
+are `usage`, `not_found`, `running`, `not_running` and `failed`. Shapes:
+
+- `run --json`: `{"id","name","command","command_string","cwd","created_ms",
+  "created_at","notify_target","notify_warning","heartbeat_ms","heartbeat",
+  "read_hint","wait"}` (`wait` is null, or `{"wait_ms","timed_out","state",
+  "exit_code","output"}`).
+- `list --json`: lines of `{"id","name","state","exit","exit_code","cmd",
+  "command","heartbeats","created_ms","created_at","done_ms","done_at",
+  "duration_ms"}`.
+- `show --json`: the job plus `notify_*`, `heartbeat_ms`, `heartbeats`,
+  `output`, `line_count` and ISO dates.
+- `tail --json`: `{"id","lines_requested","line_count","output","lines"}`.
+- `check --json`: `{"id","state","exit_code","checks","pass","total",
+  "success",...}` with `notify_outcome` and `progress_notify`.
+- `kill --json`: `{"id","state","signalled","detail","done_ms","done_at"}`.
+- `clean --json`: `{"removed","removed_ids"}`.
 
 Run `agent-shell <command> --help` before you first use a command.
 
