@@ -1,6 +1,6 @@
 # agent-shell
 
-Fire-and-forget shell execution for AI agents: run in background, get one notify turn when done.
+Fire-and-forget shell jobs for AI agents: run in the background, get progress turns while it runs and one completion turn when it is done. Output is text by default; add `--json` for JSON that scripts can parse.
 
 ## Install
 
