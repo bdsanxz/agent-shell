@@ -338,12 +338,12 @@ describe("0.6.0 item 4: heartbeat counters", () => {
     expect(st["heartbeats_skipped_backoff"] as number).toBeGreaterThanOrEqual(1);
     expect(String(st["last_heartbeat_detail"])).not.toBe("");
     const show = cli(home, ["show", id]);
-    expect(show.out).toMatch(/heartbeats sent \d+, skipped \d+ \(backoff \d+, busy \d+\), failed \d+/);
+    expect(show.out).toMatch(/heartbeats sent \d+ \(deferred \d+\), skipped \d+ \(backoff \d+, busy \d+\), failed \d+/);
     const showJson = JSON.parse(cli(home, ["show", id, "--json"]).out) as Record<string, unknown>;
     expect(showJson["heartbeats_sent"]).toBe(st["heartbeats_sent"]);
     expect(showJson["heartbeats"]).toBe(st["heartbeats_sent"]);
     const check = cli(home, ["check", id]);
-    expect(check.out).toMatch(/heartbeats sent \d+, skipped \d+ \(backoff \d+, busy \d+\), failed \d+/);
+    expect(check.out).toMatch(/heartbeats sent \d+ \(deferred \d+\), skipped \d+ \(backoff \d+, busy \d+\), failed \d+/);
     const checkJson = JSON.parse(cli(home, ["check", id, "--json"]).out) as Record<string, unknown>;
     expect(checkJson["heartbeats_sent"]).toBe(st["heartbeats_sent"]);
     expect(checkJson["heartbeats_skipped_backoff"]).toBe(st["heartbeats_skipped_backoff"]);

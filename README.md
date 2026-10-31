@@ -47,14 +47,22 @@ own jobs, `--all` means every job on the machine. While it runs, the
 supervisor sends one progress notify turn every 2 minutes by default
 (`--heartbeat <duration>` changes the base; `--no-heartbeat`,
 `--heartbeat 0` and `off` disable it), each carrying the last output line so
-you can tell stuck from working. When the last line stops changing, notifies
-back off: the interval doubles after each unchanged beat up to 30m
+you can tell stuck from working. Every progress turn ends with the next
+expected beat (`Next progress in ~10s`) using the current (possibly
+backed-off) interval. When the last line stops changing, notifies back off:
+the interval doubles after each unchanged beat up to 30m
 (env `AGENT_SHELL_HEARTBEAT_MAX_MS` for tests) and resets on new output;
 `--heartbeat-fixed` disables back-off. Heartbeats read the target status via
-`hcx ls --json` (5 s timeout, one call per heartbeat) and skip when it is
-`working` or `blocked`; busy and back-off skips are not failures. Counters
-show in `show` and `check` (`heartbeats sent S, skipped K (backoff B, busy U),
-failed F`) with `heartbeats` as an alias of sent. The current interval shows
+`hcx ls --json` (5 s timeout, one call per heartbeat) and defer when it is
+`working` or `blocked`: the beat is re-checked every 3 s
+(env `AGENT_SHELL_BUSY_POLL_MS` for tests, minimum 200 ms) and sent once idle
+with the latest line, ending at 80% of the interval; a still-busy beat counts
+as `heartbeats_skipped_busy` as before, a sent-after-wait beat also counts as
+`heartbeats_deferred`, and a job finishing mid-wait drops the pending beat.
+A back-off-suppressed beat is never deferred. Busy (at deadline) and back-off
+skips are not failures. Counters show in `show` and `check`
+(`heartbeats sent S (deferred D), skipped K (backoff B, busy U), failed F`)
+with `heartbeats` as an alias of sent (old files default `deferred` to 0). The current interval shows
 in `show` (`heartbeat_current ...` and `--json heartbeat_current_ms`). When
 it finishes, the supervisor records the job as done or failed first, then
 sends one completion turn to the notify target (your own pane by default, or
@@ -112,7 +120,7 @@ are `usage`, `not_found`, `running`, `not_running` and `failed`. Shapes:
   "command","heartbeats","created_ms","created_at","done_ms","done_at",
   "duration_ms"}` (`state` includes `lost`; `list --all --json` adds `owner`).
 - `show --json`: the job plus `notify_*`, `heartbeat_ms`, `heartbeat_fixed`,
-  `heartbeat_current_ms`, `heartbeats`, `heartbeats_sent`,
+  `heartbeat_current_ms`, `heartbeats`, `heartbeats_sent`, `heartbeats_deferred`,
   `heartbeats_skipped_backoff`, `heartbeats_skipped_busy`, `heartbeats_failed`,
   `output` (sanitised), `lines`, `line_count`, `truncated`, `pgid` and ISO
   dates (`state` includes `lost`).

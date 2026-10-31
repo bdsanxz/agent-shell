@@ -59,15 +59,18 @@ How it works:
   Notify turns go over the old herdr server (\`herdr agent prompt\`) when it runs,
   else herdr-core via \`hcx send --agent-only --no-footer --json\` (needs
   hcx 0.3.0 or newer; hcx refuses a plain shell or unknown kind before sending).
-  Heartbeats read the target via hcx ls --json and skip working/blocked
-  (busy skips are not failures); completion sends unconditionally.
-  The herdr route is skipped silently when no old server runs.
+  Heartbeats read the target via hcx ls --json and defer when working/blocked,
+  sending once idle with the latest line (a busy beat still counts as skipped
+  only at 80% of the interval; completion sends unconditionally).
+  Every progress turn ends with the next expected beat. The herdr route is
+  skipped silently when no old server runs.
 
 Environment:
   AGENT_SHELL_HOME   state root instead of ~/.local/cache/agent-shell
   XDG_CACHE_HOME     cache root holding agent-shell/ when AGENT_SHELL_HOME is unset
   AGENT_SHELL_HEARTBEAT_MAX_MS   heartbeat back-off cap in ms (default 1800000)
   AGENT_SHELL_DEFAULT_HEARTBEAT_MS   default heartbeat in ms (tests only)
+  AGENT_SHELL_BUSY_POLL_MS   busy re-check interval in ms (default 3000, minimum 200; tests only)
   AGENT_SHELL_OWNER   owner override instead of $HC_TERMINAL_ID / $HERDR_PANE_ID (tests, scripts)
 
 Exit codes:
@@ -113,8 +116,10 @@ With --json, stdout is one JSON object (no table, no prose):
 "heartbeat_current_ms","read_hint","wait"}
 "wait" is null without --wait, else {"wait_ms","timed_out","state",
 "exit_code","output"}. command_string is POSIX shell-quoted.
-Heartbeats read the target via hcx ls --json and skip working/blocked;
-completion sends unconditionally (30s timeout, heartbeat 10s).`,
+Heartbeats read the target via hcx ls --json and defer when working/blocked,
+sending once idle with the latest line (busy skip only at 80% of the interval);
+completion sends unconditionally (30s timeout, heartbeat 10s). Every progress
+turn ends with the next expected beat.`,
   list: `agent-shell list — list jobs (running first, then newest done)
 
 Usage: agent-shell list [--all] [--json]
@@ -147,12 +152,12 @@ With --json, stdout is one JSON object (no prose):
 "state","exit_code","duration_ms","done_ms","done_at","error",
 "notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
 "heartbeat_ms","heartbeat_fixed","heartbeat_current_ms","heartbeats",
-"heartbeats_sent","heartbeats_skipped_backoff","heartbeats_skipped_busy",
-"heartbeats_failed","last_heartbeat_ms","last_heartbeat_at",
-"last_heartbeat_detail","tail_lines_requested","output","lines","line_count",
-"truncated","pgid"}.
+"heartbeats_sent","heartbeats_deferred","heartbeats_skipped_backoff",
+"heartbeats_skipped_busy","heartbeats_failed","last_heartbeat_ms",
+"last_heartbeat_at","last_heartbeat_detail","tail_lines_requested","output",
+"lines","line_count","truncated","pgid"}.
 command_string is POSIX shell-quoted (copy-paste reruns the same command).
-Heartbeats print as: heartbeats sent S, skipped K (backoff B, busy U), failed F.`,
+Heartbeats print as: heartbeats sent S (deferred D), skipped K (backoff B, busy U), failed F.`,
   tail: `agent-shell tail — print the tail of one job's output
 
 Usage: agent-shell tail <id> [--lines <n>] [--json]
@@ -193,8 +198,8 @@ With --json, stdout is one JSON object (no prose) with the same exit codes:
 {"id","state","exit_code","output_lines","output_ok","output_detail",
 "notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
 "notify_ok","progress_notify","heartbeats","heartbeats_sent",
-"heartbeats_skipped_backoff","heartbeats_skipped_busy","heartbeats_failed",
-"checks","pass","total","success","success_detail"}.
+"heartbeats_deferred","heartbeats_skipped_backoff","heartbeats_skipped_busy",
+"heartbeats_failed","checks","pass","total","success","success_detail"}.
 The notify line is ok only for delivered or unconfirmed; unconfirmed prints
 as "ok notify: unconfirmed (delivery not verified)". A timed-out completion
 (exit null / kind timeout) is unconfirmed, not failed (completion 30s,
@@ -438,6 +443,7 @@ function cmdShow(argv: string[]): number {
   const hbBackoff = status?.heartbeats_skipped_backoff ?? 0;
   const hbBusy = status?.heartbeats_skipped_busy ?? 0;
   const hbFailed = status?.heartbeats_failed ?? 0;
+  const hbDeferred = status?.heartbeats_deferred ?? 0;
   const hbSkipped = hbBackoff + hbBusy;
   if (wantsJson(p)) {
     const raw = readTailDetailed(dir, tail);
@@ -467,6 +473,7 @@ function cmdShow(argv: string[]): number {
       heartbeat_current_ms: hbCurrent,
       heartbeats: status?.heartbeats ?? hbSent,
       heartbeats_sent: hbSent,
+      heartbeats_deferred: hbDeferred,
       heartbeats_skipped_backoff: hbBackoff,
       heartbeats_skipped_busy: hbBusy,
       heartbeats_failed: hbFailed,
@@ -499,7 +506,7 @@ function cmdShow(argv: string[]): number {
   if (status?.notify_note) console.log(`notify_note ${status.notify_note}`);
   console.log(`heartbeat ${hbBase === null ? "off" : `${hbBase}ms`}`);
   if (hbBase !== null) console.log(`heartbeat_current ${hbCurrent === null ? "off" : `${hbCurrent}ms`}`);
-  console.log(`heartbeats sent ${hbSent}, skipped ${hbSkipped} (backoff ${hbBackoff}, busy ${hbBusy}), failed ${hbFailed}`);
+  console.log(`heartbeats sent ${hbSent} (deferred ${hbDeferred}), skipped ${hbSkipped} (backoff ${hbBackoff}, busy ${hbBusy}), failed ${hbFailed}`);
   if (status?.last_heartbeat_detail) console.log(`last_heartbeat ${status.last_heartbeat_detail}`);
   console.log(`--- output (last ${tail} lines) ---`);
   const rawTail = readTailDetailed(dir, tail);
@@ -634,8 +641,9 @@ function cmdCheck(argv: string[]): number {
   const hbBackoff = status?.heartbeats_skipped_backoff ?? 0;
   const hbBusy = status?.heartbeats_skipped_busy ?? 0;
   const hbFailed = status?.heartbeats_failed ?? 0;
+  const hbDeferred = status?.heartbeats_deferred ?? 0;
   const hbSkipped = hbBackoff + hbBusy;
-  const hbLine = `heartbeats sent ${hbSent}, skipped ${hbSkipped} (backoff ${hbBackoff}, busy ${hbBusy}), failed ${hbFailed}`;
+  const hbLine = `heartbeats sent ${hbSent} (deferred ${hbDeferred}), skipped ${hbSkipped} (backoff ${hbBackoff}, busy ${hbBusy}), failed ${hbFailed}`;
   if (wantsJson(p)) {
     printJson({
       id,
@@ -655,6 +663,7 @@ function cmdCheck(argv: string[]): number {
       progress_notify: lastProgress,
       heartbeats: status?.heartbeats ?? hbSent,
       heartbeats_sent: hbSent,
+      heartbeats_deferred: hbDeferred,
       heartbeats_skipped_backoff: hbBackoff,
       heartbeats_skipped_busy: hbBusy,
       heartbeats_failed: hbFailed,
@@ -822,6 +831,7 @@ function cmdKill(argv: string[]): number {
       heartbeats_skipped_backoff: prev?.heartbeats_skipped_backoff ?? 0,
       heartbeats_skipped_busy: prev?.heartbeats_skipped_busy ?? 0,
       heartbeats_failed: prev?.heartbeats_failed ?? 0,
+      heartbeats_deferred: prev?.heartbeats_deferred ?? 0,
       last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
       last_heartbeat_detail: prev?.last_heartbeat_detail ?? detail,
       error: prev?.error ?? null,
@@ -896,6 +906,7 @@ function cmdKill(argv: string[]): number {
         heartbeats_skipped_backoff: prevE?.heartbeats_skipped_backoff ?? 0,
         heartbeats_skipped_busy: prevE?.heartbeats_skipped_busy ?? 0,
         heartbeats_failed: prevE?.heartbeats_failed ?? 0,
+        heartbeats_deferred: prevE?.heartbeats_deferred ?? 0,
         last_heartbeat_ms: prevE?.last_heartbeat_ms ?? null,
         last_heartbeat_detail: prevE?.last_heartbeat_detail ?? "",
         error: prevE?.error ?? null,
@@ -960,6 +971,7 @@ function cmdKill(argv: string[]): number {
     heartbeats_skipped_backoff: prev?.heartbeats_skipped_backoff ?? 0,
     heartbeats_skipped_busy: prev?.heartbeats_skipped_busy ?? 0,
     heartbeats_failed: prev?.heartbeats_failed ?? 0,
+    heartbeats_deferred: prev?.heartbeats_deferred ?? 0,
     last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
     last_heartbeat_detail: prev?.last_heartbeat_detail ?? "",
     error: prev?.error ?? null,
@@ -1064,6 +1076,32 @@ function formatElapsed(ms: number): string {
   const m = Math.floor(s / 60);
   if (m < 60) return `${m}m${s % 60}s`;
   return `${Math.floor(m / 60)}h${m % 60}m`;
+}
+
+/** Rounded next-beat label like ~10s, ~24s or ~2m. */
+function formatNextIn(ms: number): string {
+  if (ms < 60_000) return `~${Math.max(1, Math.round(ms / 1000))}s`;
+  if (ms < 3_600_000) return `~${Math.max(1, Math.round(ms / 60_000))}m`;
+  return `~${Math.max(1, Math.round(ms / 3_600_000))}h`;
+}
+
+/** Busy re-check interval: AGENT_SHELL_BUSY_POLL_MS for tests, minimum 200ms. */
+function busyPollMs(): number {
+  const raw = process.env.AGENT_SHELL_BUSY_POLL_MS;
+  if (raw === undefined || raw.trim() === "") return 3000;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n)) return 3000;
+  return Math.max(200, Math.floor(n));
+}
+
+/** One progress turn, ending with the next expected beat. */
+function buildHeartbeatText(name: string, elapsedMs: number, last: string, id: string, intervalMs: number | null): string {
+  let text =
+    `shell job '${name}' still running (${formatElapsed(elapsedMs)} elapsed). ` +
+    (last !== "" ? `Last line: ${last.slice(0, 160)}. ` : `No output yet. `) +
+    `No action needed; completion will notify. Read with: agent-shell tail ${id}.`;
+  if (intervalMs !== null) text += ` Next progress in ${formatNextIn(intervalMs)}.`;
+  return text;
 }
 
 function sanitizeName(name: string): string {
@@ -1175,6 +1213,7 @@ async function cmdRun(argv: string[]): Promise<number> {
     heartbeats_skipped_backoff: 0,
     heartbeats_skipped_busy: 0,
     heartbeats_failed: 0,
+    heartbeats_deferred: 0,
     last_heartbeat_ms: null,
     last_heartbeat_detail: "",
     error: null,
@@ -1363,6 +1402,7 @@ async function supervise(id: string): Promise<number> {
       heartbeats_skipped_backoff: 0,
       heartbeats_skipped_busy: 0,
       heartbeats_failed: 0,
+      heartbeats_deferred: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
@@ -1383,6 +1423,7 @@ async function supervise(id: string): Promise<number> {
       heartbeats_skipped_backoff: 0,
       heartbeats_skipped_busy: 0,
       heartbeats_failed: 0,
+      heartbeats_deferred: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
@@ -1405,6 +1446,7 @@ async function supervise(id: string): Promise<number> {
       heartbeats_skipped_backoff: 0,
       heartbeats_skipped_busy: 0,
       heartbeats_failed: 0,
+      heartbeats_deferred: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
@@ -1421,6 +1463,7 @@ async function supervise(id: string): Promise<number> {
   let heartbeatsSkippedBackoff = 0;
   let heartbeatsSkippedBusy = 0;
   let heartbeatsFailed = 0;
+  let heartbeatsDeferred = 0;
   let lastHeartbeatMs: number | null = null;
   let lastHeartbeatDetail = "";
   let finished = false;
@@ -1443,15 +1486,19 @@ async function supervise(id: string): Promise<number> {
 
   // Progress notifies while the command runs: last output line every heartbeatMs.
   // Heartbeats read the target status via `hcx ls --json` (5s timeout, one
-  // call per heartbeat) and skip when it is working or blocked; a busy skip
-  // counts as skipped, not failed. Completion sends unconditionally. Neither
-  // uses `--if idle` or retries. When the last line is unchanged and
-  // back-off is enabled, skip the notify and double the interval up to the
-  // cap; reset on new output. Skipped heartbeats are not failures. Skipped
-  // entirely when disabled or no target. The wait races the heartbeat
-  // interval against process exit, so a job shorter than the interval
-  // finishes at once with no progress notify. An unreadable status (null) is
-  // not "not running": keep supervising.
+  // call per heartbeat) and defer when it is working or blocked, sending ONE
+  // beat once idle with the latest line; the wait ends at 80% of the current
+  // interval, then a still-busy beat counts as skipped_busy (not failed).
+  // A back-off-suppressed beat (unchanged output) is never deferred.
+  // Completion sends unconditionally. Neither uses `--if idle` or retries.
+  // When the last line is unchanged and back-off is enabled, skip the notify
+  // and double the interval up to the cap; reset on new output. Skipped
+  // heartbeats are not failures. Skipped entirely when disabled or no
+  // target. The wait races the heartbeat interval against process exit, so a
+  // job shorter than the interval finishes at once with no progress notify.
+  // An unreadable status (null) is not "not running": keep supervising.
+  // Polling never blocks supervision: one hcx ls per poll, 5s timeout, and
+  // the job finishing always wins over a pending beat.
   if (heartbeatMs !== null && meta.notify_target !== "") {
     const done = exitPromise.then(
       () => {},
@@ -1476,6 +1523,7 @@ async function supervise(id: string): Promise<number> {
         heartbeats_skipped_backoff: heartbeatsSkippedBackoff,
         heartbeats_skipped_busy: heartbeatsSkippedBusy,
         heartbeats_failed: heartbeatsFailed,
+        heartbeats_deferred: heartbeatsDeferred,
         last_heartbeat_ms: lastHeartbeatMs,
         last_heartbeat_detail: lastHeartbeatDetail,
         error: null,
@@ -1487,7 +1535,8 @@ async function supervise(id: string): Promise<number> {
       if (finished) break;
       const cur = readStatus(dir);
       if (cur && cur.state !== "running") return 0;
-      const elapsed = nowMs() - started;
+      const dueMs = nowMs();
+      const elapsed = dueMs - started;
       const last = lastOutputLine(dir);
       if (!heartbeatFixed && prevLine !== null && last === prevLine) {
         unchangedStreak++;
@@ -1506,16 +1555,86 @@ async function supervise(id: string): Promise<number> {
         currentInterval = heartbeatMs;
       }
       prevLine = last;
-      const hbText =
-        `shell job '${meta.name}' still running (${formatElapsed(elapsed)} elapsed). ` +
-        (last !== "" ? `Last line: ${last.slice(0, 160)}. ` : `No output yet. `) +
-        `No action needed; completion will notify. Read with: agent-shell tail ${meta.id}`;
+      const hbText = buildHeartbeatText(meta.name, elapsed, last, meta.id, currentInterval);
       const hbResult = notify(meta.notify_target, hbText, { ifIdle: true });
-      if (hbResult.outcome === "delivered" || hbResult.outcome === "unconfirmed") heartbeatsSent++;
-      else if (hbResult.outcome === "skipped_busy") heartbeatsSkippedBusy++;
-      else heartbeatsFailed++;
+      if (hbResult.outcome === "delivered" || hbResult.outcome === "unconfirmed") {
+        heartbeatsSent++;
+        lastHeartbeatMs = nowMs();
+        lastHeartbeatDetail = hbResult.detail;
+        writeRunning();
+        if (finished) break;
+        continue;
+      }
+      if (hbResult.outcome !== "skipped_busy") {
+        heartbeatsFailed++;
+        lastHeartbeatMs = nowMs();
+        lastHeartbeatDetail = hbResult.detail;
+        writeRunning();
+        if (finished) break;
+        continue;
+      }
+      const deadline = dueMs + Math.floor((currentInterval as number) * 0.8);
+      const pollMs = busyPollMs();
+      let deferredSent = false;
+      let deferredFailed = false;
+      let lastBusyDetail = hbResult.detail;
+      let lastPollBusyDetail: string | null = null;
+      let dropped = false;
+      for (;;) {
+        if (finished) {
+          dropped = true;
+          break;
+        }
+        const cur2 = readStatus(dir);
+        if (cur2 && cur2.state !== "running") return 0;
+        const now = nowMs();
+        if (now >= deadline) break;
+        const waitMs = Math.min(pollMs, Math.max(0, deadline - now));
+        await Promise.race([done, Bun.sleep(waitMs)]);
+        if (finished) {
+          dropped = true;
+          break;
+        }
+        const cur3 = readStatus(dir);
+        if (cur3 && cur3.state !== "running") return 0;
+        if (nowMs() >= deadline) break;
+        const freshElapsed = nowMs() - started;
+        const freshLast = lastOutputLine(dir);
+        const retryText = buildHeartbeatText(meta.name, freshElapsed, freshLast, meta.id, currentInterval);
+        const retry = notify(meta.notify_target, retryText, { ifIdle: true });
+        if (retry.outcome === "delivered" || retry.outcome === "unconfirmed") {
+          deferredSent = true;
+          prevLine = freshLast;
+          lastHeartbeatMs = nowMs();
+          lastHeartbeatDetail = retry.detail;
+          break;
+        }
+        if (retry.outcome !== "skipped_busy") {
+          deferredFailed = true;
+          prevLine = freshLast;
+          lastHeartbeatMs = nowMs();
+          lastHeartbeatDetail = retry.detail;
+          break;
+        }
+        lastPollBusyDetail = retry.detail;
+      }
+      if (dropped || finished) break;
+      if (deferredSent) {
+        heartbeatsSent++;
+        heartbeatsDeferred++;
+        writeRunning();
+        if (finished) break;
+        continue;
+      }
+      if (deferredFailed) {
+        heartbeatsFailed++;
+        writeRunning();
+        if (finished) break;
+        continue;
+      }
+      heartbeatsSkippedBusy++;
       lastHeartbeatMs = nowMs();
-      lastHeartbeatDetail = hbResult.detail;
+      lastHeartbeatDetail = lastPollBusyDetail ?? lastBusyDetail;
       writeRunning();
       if (finished) break;
     }
@@ -1546,6 +1665,7 @@ async function supervise(id: string): Promise<number> {
     heartbeats_skipped_backoff: heartbeatsSkippedBackoff,
     heartbeats_skipped_busy: heartbeatsSkippedBusy,
     heartbeats_failed: heartbeatsFailed,
+    heartbeats_deferred: heartbeatsDeferred,
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
     error: null,
@@ -1569,6 +1689,7 @@ async function supervise(id: string): Promise<number> {
     heartbeats_skipped_backoff: heartbeatsSkippedBackoff,
     heartbeats_skipped_busy: heartbeatsSkippedBusy,
     heartbeats_failed: heartbeatsFailed,
+    heartbeats_deferred: heartbeatsDeferred,
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
     error: null,

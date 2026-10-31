@@ -88,6 +88,8 @@ export interface Status {
   heartbeats_skipped_backoff?: number;
   heartbeats_skipped_busy?: number;
   heartbeats_failed?: number;
+  /** Delayed-then-sent busy beats; old files default to 0. */
+  heartbeats_deferred?: number;
   last_heartbeat_ms: number | null;
   last_heartbeat_detail: string;
   /** Start-up failure (missing executable, bad cwd, spawn error); null otherwise. */
@@ -158,6 +160,7 @@ export function readStatus(dir: string): Status | null {
       heartbeats_skipped_backoff: raw.heartbeats_skipped_backoff ?? 0,
       heartbeats_skipped_busy: raw.heartbeats_skipped_busy ?? 0,
       heartbeats_failed: raw.heartbeats_failed ?? 0,
+      heartbeats_deferred: raw.heartbeats_deferred ?? 0,
       last_heartbeat_ms: raw.last_heartbeat_ms ?? null,
       last_heartbeat_detail: raw.last_heartbeat_detail ?? "",
       error: raw.error ?? null,
