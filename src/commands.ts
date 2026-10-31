@@ -4,7 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { UsageError, bool, parseArgs, str, unknownFlags } from "./args.ts";
-import { currentOwner, defaultTarget, notify } from "./notify.ts";
+import { checkNotifyTarget, currentOwner, defaultTarget, notify, type NotifyResult } from "./notify.ts";
 import {
   defaultHeartbeatMs,
   freshId,
@@ -46,9 +46,8 @@ How it works:
   4. Read it with \`agent-shell show <id>\` or \`agent-shell tail <id>\`.
      Nobody polls: notify turns are the only wake-up.
   Notify turns go over the old herdr server (\`herdr agent prompt\`) when it runs,
-  else herdr-core. There, a target whose live terminal kind is an agent gets
-  \`hcx send --no-footer\` (untagged, no sender footer; needs hcx 0.1.3 or newer);
-  a shell kind, or an unknown kind, keeps \`hc send\`.
+  else herdr-core via \`hcx send --agent-only --no-footer --json\` (needs
+  hcx 0.3.0 or newer; hcx refuses a plain shell or unknown kind before sending).
 
 Environment:
   AGENT_SHELL_HOME   state root instead of ~/.local/cache/agent-shell
@@ -68,12 +67,11 @@ Examples:
 Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] -- <command...>
 
   --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
-  --notify <target>  Who gets the notify turns: a herdr agent name, pane id or hc terminal.
-                     An agent terminal is notified untagged with no sender footer
-                     (\`hcx send --no-footer\`, needs hcx 0.1.3 or newer); a shell
-                     terminal, or one whose kind is unknown, keeps the tagged
-                     \`hc send\`. Default: your own pane ($HERDR_PANE_ID) or terminal
-                     ($HC_TERMINAL_ID).
+  --notify <target>  Who gets the notify turns: a herdr agent name, pane id, hc terminal
+                     or tab name (hcx resolves tab names). Notified over the old herdr
+                     server when it runs, else via \`hcx send --agent-only --no-footer
+                     --json\` (needs hcx 0.3.0 or newer). Default: your own pane
+                     ($HERDR_PANE_ID) or terminal ($HC_TERMINAL_ID).
   --cwd <dir>        Directory to run in. Default: current directory.
   --heartbeat <d>    Progress notify interval with the last output line (e.g. 30s, 2m, 5m).
                      Default: 2m. Minimum: 1s. Use 0 or off to disable.
@@ -260,6 +258,10 @@ function cmdShow(argv: string[]): number {
     console.log(`duration_ms ${status.duration_ms}`);
   if (status?.error) console.log(`error ${status.error}`);
   if (status?.notify_detail) console.log(`notify ${status.notify_detail}`);
+  if (status?.notify_outcome) console.log(`notify_outcome ${status.notify_outcome}`);
+  if (status?.notify_route) console.log(`notify_route ${status.notify_route}`);
+  if (status?.notify_agent) console.log(`notify_agent ${status.notify_agent}`);
+  if (status?.notify_note) console.log(`notify_note ${status.notify_note}`);
   const hb = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
   console.log(`heartbeat ${hb === null ? "off" : `${hb}ms`}`);
   if ((status?.heartbeats ?? 0) > 0) console.log(`heartbeats ${status!.heartbeats}`);
@@ -327,13 +329,19 @@ function cmdCheck(argv: string[]): number {
     lines = null;
   }
   line(lines !== null, lines !== null ? `output: ${lines.length} lines` : `output: output.log is missing or unreadable`);
-  const notified = status?.notified === true;
   const detail = status?.notify_detail ?? "";
   const noTarget = detail.includes("no notify target") || (meta.notify_target ?? "") === "";
   if (noTarget) {
     line(true, `notify: n/a (no notify target)`);
   } else {
-    line(notified, notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`);
+    const outcome = status?.notify_outcome ?? "";
+    const okOutcome = outcome === "delivered" || outcome === "unconfirmed";
+    if (outcome !== "") {
+      line(okOutcome, okOutcome ? `notify: ${detail}` : `notify: not delivered [${outcome}] (${detail || "no notify recorded"})`);
+    } else {
+      const notified = status?.notified === true;
+      line(notified, notified ? `notify: ${detail}` : `notify: not delivered (${detail || "no notify recorded"})`);
+    }
   }
   // The last progress notify is informational: a failure here is visible, but only
   // the completion notify decides whether the job's result is trusted.
@@ -454,6 +462,10 @@ function cmdKill(argv: string[]): number {
     duration_ms: null,
     notified: false,
     notify_detail: killed ? "killed by user; no completion notify" : "no live process found",
+    notify_outcome: "",
+    notify_route: null,
+    notify_agent: null,
+    notify_note: null,
     heartbeats: prev?.heartbeats ?? 0,
     last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
     last_heartbeat_detail: prev?.last_heartbeat_detail ?? "",
@@ -512,6 +524,19 @@ function parseHeartbeatMs(raw: string | undefined, disabled: boolean): number | 
 /** Last non-empty line of the job log ("" when nothing yet). */
 function lastOutputLine(dir: string): string {
   return tailLog(dir, 5).split("\n").filter((l) => l.trim() !== "").pop() ?? "";
+}
+
+/** Status fields for a notify result: `notified` is true for delivered or
+ * unconfirmed (both pass `check`); the rest carry the typed outcome. */
+function statusFromNotify(r: NotifyResult) {
+  return {
+    notified: r.outcome === "delivered" || r.outcome === "unconfirmed",
+    notify_detail: r.detail,
+    notify_outcome: r.outcome,
+    notify_route: r.route,
+    notify_agent: r.agent,
+    notify_note: r.note,
+  };
 }
 
 /** Short elapsed label like 45.0s, 2m5s or 1h3m. */
@@ -612,6 +637,10 @@ async function cmdRun(argv: string[]): Promise<number> {
     duration_ms: null,
     notified: false,
     notify_detail: "",
+    notify_outcome: "",
+    notify_route: null,
+    notify_agent: null,
+    notify_note: null,
     heartbeats: 0,
     last_heartbeat_ms: null,
     last_heartbeat_detail: "",
@@ -625,6 +654,8 @@ async function cmdRun(argv: string[]): Promise<number> {
   } else {
     console.log(`notify ${target}`);
   }
+  const notifyWarning = checkNotifyTarget(str(p, "notify"));
+  if (notifyWarning !== null) console.log(notifyWarning);
   console.log(`heartbeat ${heartbeatMs === null ? "off" : `every ${formatElapsed(heartbeatMs)}`}`);
   console.log(`read with: agent-shell show ${id}`);
   if (waitMs === undefined) return 0;
@@ -701,13 +732,17 @@ async function supervise(id: string): Promise<number> {
       duration_ms: failedAt - started,
       notified: false,
       notify_detail: "pending: completion notify not sent yet",
+      notify_outcome: "",
+      notify_route: null,
+      notify_agent: null,
+      notify_note: null,
       heartbeats: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
     });
     const text = `shell job '${meta.name}' failed to start: ${msg}. Read with: agent-shell show ${meta.id}`;
-    const detail = notify(meta.notify_target, text);
+    const result = notify(meta.notify_target, text);
     const cur = readStatus(dir);
     if (cur && cur.state === "killed") return 0;
     writeStatus(dir, {
@@ -715,8 +750,7 @@ async function supervise(id: string): Promise<number> {
       exit_code: -1,
       done_ms: failedAt,
       duration_ms: failedAt - started,
-      notified: detail.startsWith("notified"),
-      notify_detail: detail,
+      ...statusFromNotify(result),
       heartbeats: 0,
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
@@ -743,7 +777,9 @@ async function supervise(id: string): Promise<number> {
     },
   );
 
-  // Progress notifies while the command runs: last output line every heartbeatMs.
+  // Progress notifies while the command runs: last output line every heartbeatMs,
+  // via `hcx send --if idle` so a busy agent is skipped (a skipped heartbeat
+  // is not a failure and is not retried). Completion never uses `--if`.
   // Skipped entirely when disabled or when there is no notify target.
   // The wait races the heartbeat interval against process exit, so a job
   // shorter than the interval finishes at once with no progress notify.
@@ -765,10 +801,10 @@ async function supervise(id: string): Promise<number> {
         `shell job '${meta.name}' still running (${formatElapsed(elapsed)} elapsed). ` +
         (last !== "" ? `Last line: ${last.slice(0, 160)}. ` : `No output yet. `) +
         `No action needed; completion will notify. Read with: agent-shell tail ${meta.id}`;
-      const hbDetail = notify(meta.notify_target, hbText);
-      if (hbDetail.startsWith("notified")) heartbeats++;
+      const hbResult = notify(meta.notify_target, hbText, { ifIdle: true });
+      if (hbResult.outcome === "delivered" || hbResult.outcome === "unconfirmed") heartbeats++;
       lastHeartbeatMs = nowMs();
-      lastHeartbeatDetail = hbDetail;
+      lastHeartbeatDetail = hbResult.detail;
       writeStatus(dir, {
         state: "running",
         exit_code: null,
@@ -776,6 +812,10 @@ async function supervise(id: string): Promise<number> {
         duration_ms: null,
         notified: false,
         notify_detail: "",
+        notify_outcome: "",
+        notify_route: null,
+        notify_agent: null,
+        notify_note: null,
         heartbeats,
         last_heartbeat_ms: lastHeartbeatMs,
         last_heartbeat_detail: lastHeartbeatDetail,
@@ -801,6 +841,10 @@ async function supervise(id: string): Promise<number> {
     duration_ms: done - started,
     notified: false,
     notify_detail: "pending: completion notify not sent yet",
+    notify_outcome: "",
+    notify_route: null,
+    notify_agent: null,
+    notify_note: null,
     heartbeats,
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
@@ -810,7 +854,7 @@ async function supervise(id: string): Promise<number> {
   const secs = ((done - started) / 1000).toFixed(1);
   let text = `shell job '${meta.name}' done (exit ${code}, ${secs}s). Read with: agent-shell show ${meta.id}`;
   if (lastLine !== "") text += ` Last line: ${lastLine.slice(0, 160)}`;
-  const detail = notify(meta.notify_target, text);
+  const result = notify(meta.notify_target, text);
   const raced = readStatus(dir);
   if (raced && raced.state === "killed") return 0;
   writeStatus(dir, {
@@ -818,8 +862,7 @@ async function supervise(id: string): Promise<number> {
     exit_code: code,
     done_ms: done,
     duration_ms: done - started,
-    notified: detail.startsWith("notified"),
-    notify_detail: detail,
+    ...statusFromNotify(result),
     heartbeats,
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,

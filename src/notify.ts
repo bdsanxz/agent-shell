@@ -1,19 +1,16 @@
 // Notification: one fire-and-forget turn, never `--wait`: `herdr agent
-// prompt`, falling back to herdr-core when the old herdr server is stopped.
-// On herdr-core an agent target gets `hcx send --no-footer` (untagged, no
-// sender footer; needs hcx 0.1.3 or newer); a plain shell keeps `hc send`
-// (tagged), since raw text would run as a command in its prompt. The kind
-// comes from the live terminal list, and a tab listed as a plain shell is
-// checked once more for its foreground program (an opencode tab is an agent,
-// not a shell); a target whose kind is unknown also keeps the tagged send. An
-// hcx without the flag (older or with an unreadable version) keeps the tagged
-// send for an agent target too, with a note saying why.
+// prompt`, falling back to herdr-core via hcx 0.3.0 when the old herdr server
+// is stopped. On herdr-core the only route is `hcx send --agent-only
+// --no-footer --json`: hcx looks the kind up first and refuses a plain shell
+// or an unknown kind BEFORE sending (kind `plain_shell`, exit 4). Success
+// prints hc's JSON plus `delivered` (true / false / null), `route`, `agent`
+// and `note`. There is no `hc send` fallback: typing raw text into a shell
+// would run it as a command.
 //
 // The target is the pane, agent or terminal that ran the job. Delivery is
 // best effort: a failed notify never fails the job, it is recorded instead.
 
 import { spawnSync } from "node:child_process";
-import { basename } from "node:path";
 import type { Owner } from "./store.ts";
 
 /** Resolve the notify target: explicit `--notify`, else the owner's pane or hc terminal. */
@@ -43,194 +40,293 @@ function haveHerdr(): boolean {
   }
 }
 
-function haveHc(): boolean {
-  try {
-    const p = spawnSync("sh", ["-c", "command -v hc"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
-    return p.status === 0 && (p.stdout as string).trim() !== "";
-  } catch {
-    return false;
-  }
+/** The typed notify outcome. `delivered` is a confirmed turn, `not_started`
+ * is a confirmed send that started no turn (do not resend), `unconfirmed` is
+ * `delivered: null` (opencode TUI or shell with no turn status, never resend),
+ * `plain_shell` is the pre-send refusal (exit 4, queued not delivered), and
+ * `failed` is anything else (timeout or nonzero after the send may have
+ * landed: never retry automatically). */
+export type NotifyOutcome = "delivered" | "not_started" | "unconfirmed" | "plain_shell" | "failed";
+
+/** One notify attempt: the outcome plus the human-readable detail line, and
+ * the machine fields from `hcx send --json` when the send ran. */
+export interface NotifyResult {
+  outcome: NotifyOutcome;
+  detail: string;
+  route: string | null;
+  agent: string | null;
+  note: string | null;
 }
 
-function haveHcx(): boolean {
-  try {
-    const p = spawnSync("sh", ["-c", "command -v hcx"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
-    return p.status === 0 && (p.stdout as string).trim() !== "";
-  } catch {
-    return false;
-  }
+/** Whether this hcx can do the 0.3.0 route, else why not. Cached per process. */
+interface HcxSupport {
+  ok: boolean;
+  reason: string;
 }
 
-/** Plain shells: an untagged footer would run as a command, so they keep `hc send`. */
-const SHELLS = new Set(["zsh", "sh", "bash", "fish", "dash", "ksh", "nu", "pwsh"]);
+let hcxSupportResult: HcxSupport | null = null;
 
-/** The foreground program of a terminal address via `hc get`: the basename of
- * `foreground.name`, lower case. Empty when the get fails, the JSON is
- * unparseable, or the shape has no name. */
-function hcForeground(address: string): string {
-  try {
-    const p = spawnSync("hc", ["get", address], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
-    if (p.status !== 0) return "";
-    const v = JSON.parse(p.stdout as string) as { foreground?: unknown };
-    if (typeof v.foreground !== "object" || v.foreground === null) return "";
-    const rec = v.foreground as Record<string, unknown>;
-    const name = typeof rec["name"] === "string" ? (rec["name"] as string) : "";
-    return basename(name).trim().toLowerCase();
-  } catch {
-    return "";
+/** hcx 0.3.0 or newer: `hcx --version --json` with `contract` >= 1 and
+ * `capabilities` containing `agent-only` and `no-footer`. An older hcx would
+ * read `--agent-only` as message text, so this gate cannot be skipped. */
+export function hcxSupport(): HcxSupport {
+  if (hcxSupportResult === null) {
+    hcxSupportResult = checkHcxSupport();
   }
+  return hcxSupportResult;
 }
 
-/** The agent kind behind a target, from `hc ls --json`: "muse", "claude-code",
- * "opencode", ... Empty when the target matches no live terminal or the list is
- * unreadable. A tab whose agent is a shell kind is checked once more with `hc get`:
- * its foreground program wins (an opencode login shell is an agent, not a shell). */
-function hcTargetKind(target: string): string {
+/** Reset the cached support (tests only). */
+export function resetHcxSupportForTests(): void {
+  hcxSupportResult = null;
+}
+
+function checkHcxSupport(): HcxSupport {
   try {
-    const p = spawnSync("hc", ["ls", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
-    if (p.status !== 0) return "";
-    const v = JSON.parse(p.stdout as string) as { terminals?: unknown };
-    if (!Array.isArray(v.terminals)) return "";
-    const want = target.trim().toLowerCase();
-    for (const t of v.terminals) {
-      if (typeof t !== "object" || t === null) continue;
-      const rec = t as Record<string, unknown>;
-      const address = typeof rec["address"] === "string" ? (rec["address"] as string) : "";
-      const name = typeof rec["name"] === "string" ? (rec["name"] as string) : "";
-      if (address.toLowerCase() !== want && name.toLowerCase() !== want) continue;
-      const agent = typeof rec["agent"] === "string" ? (rec["agent"] as string).trim().toLowerCase() : "";
-      if (SHELLS.has(agent)) {
-        const foreground = hcForeground(address);
-        if (foreground !== "" && !SHELLS.has(foreground)) return foreground;
-      }
-      return agent;
+    const p = spawnSync("hcx", ["--version", "--json"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 8000,
+    });
+    if (p.status !== 0) {
+      const err = ((p.stderr as string) ?? "").trim() || ((p.stdout as string) ?? "").trim();
+      const why = err === "" ? `exit ${p.status}` : err.split("\n")[0]!;
+      return { ok: false, reason: `hcx --version --json failed (${why})` };
     }
-    return "";
-  } catch {
-    return "";
+    let v: unknown;
+    try {
+      v = JSON.parse(p.stdout as string);
+    } catch {
+      return { ok: false, reason: "hcx version output is not JSON" };
+    }
+    if (typeof v !== "object" || v === null) return { ok: false, reason: "hcx version output is not JSON" };
+    const rec = v as Record<string, unknown>;
+    const contract = typeof rec["contract"] === "number" ? (rec["contract"] as number) : 0;
+    const caps = Array.isArray(rec["capabilities"])
+      ? (rec["capabilities"] as unknown[]).filter((c): c is string => typeof c === "string")
+      : [];
+    if (contract >= 1 && caps.includes("agent-only") && caps.includes("no-footer")) {
+      return { ok: true, reason: "" };
+    }
+    return { ok: false, reason: "hcx is older than 0.3.0 (needs contract 1 with agent-only and no-footer)" };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/ENOENT/i.test(msg)) return { ok: false, reason: "hcx is not on PATH" };
+    return { ok: false, reason: `hcx version check failed (${msg.split("\n")[0]})` };
   }
 }
 
-function herdrNotify(target: string, text: string): string {
+function herdrNotify(target: string, text: string): NotifyResult {
   try {
     const p = spawnSync("herdr", ["agent", "prompt", target, text], { encoding: "utf8", timeout: 8000 });
-    if (p.status === 0) return `notified ${target}`;
+    if (p.status === 0) return { outcome: "delivered", detail: `notified ${target}`, route: null, agent: null, note: null };
     const err = (p.stderr as string).trim();
-    if (err === "") return `notify to ${target} failed: exit ${p.status}`;
-    return `notify to ${target} failed: ${err.split("\n")[0]}`;
+    const reason = err === "" ? `exit ${p.status}` : err.split("\n")[0]!;
+    return { outcome: "failed", detail: `notify to ${target} failed: ${reason}`, route: null, agent: null, note: null };
   } catch (e) {
-    return `notify to ${target} failed: ${e instanceof Error ? e.message : String(e)}`;
+    const reason = e instanceof Error ? e.message : String(e);
+    return { outcome: "failed", detail: `notify to ${target} failed: ${reason.split("\n")[0]}`, route: null, agent: null, note: null };
   }
 }
 
-function hcNotify(target: string, text: string): string {
+function tryParseJson(text: string): Record<string, unknown> | null {
   try {
-    const p = spawnSync("hc", ["send", target, text], { encoding: "utf8", timeout: 8000 });
-    if (p.status === 0) return `notified ${target} via hc send`;
-    const err = (p.stderr as string).trim();
-    if (err === "") return `notify to ${target} via hc send failed: exit ${p.status}`;
-    return `notify to ${target} via hc send failed: ${err.split("\n")[0]}`;
-  } catch (e) {
-    return `notify to ${target} via hc send failed: ${e instanceof Error ? e.message : String(e)}`;
-  }
-}
-
-interface HcResult {
-  ok: boolean;
-  /** The note for this route, such as `notified t9 via hcx send --no-footer`. */
-  detail: string;
-  /** The short failure reason, for the fallback note. */
-  reason: string;
-}
-
-/** Whether the installed hcx can send without a footer, else why not. */
-interface HcNoFooter {
-  ok: boolean;
-  reason: string;
-}
-
-/** The hcx version from the first line of `hcx --version` ("hcx 0.1.3"), or
- * null when hcx is absent, the call fails, or the line does not parse. */
-function hcxVersion(): { major: number; minor: number; patch: number } | null {
-  try {
-    const p = spawnSync("hcx", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 });
-    if (p.status !== 0) return null;
-    const first = (p.stdout as string).split("\n")[0]?.trim() ?? "";
-    const m = first.match(/^hcx\s+v?(\d+)\.(\d+)\.(\d+)/);
-    if (m === null) return null;
-    return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+    const v = JSON.parse(text) as unknown;
+    if (typeof v === "object" && v !== null && !Array.isArray(v)) return v as Record<string, unknown>;
+    return null;
   } catch {
     return null;
   }
 }
 
-/** Whether `hcx send --no-footer` is supported here: hcx 0.1.3 or newer.
- * Cached for the process, so a job checks the version at most once — an old
- * hcx would treat `--no-footer` as message text, not a flag. */
-let hcxNoFooterResult: HcNoFooter | null = null;
-
-function hcxNoFooter(): HcNoFooter {
-  if (hcxNoFooterResult === null) {
-    const v = hcxVersion();
-    if (v === null) {
-      hcxNoFooterResult = { ok: false, reason: "hcx version unknown (--no-footer needs hcx 0.1.3+)" };
-    } else if (v.major > 0 || (v.major === 0 && v.minor > 1) || (v.major === 0 && v.minor === 1 && v.patch >= 3)) {
-      hcxNoFooterResult = { ok: true, reason: "" };
-    } else {
-      hcxNoFooterResult = { ok: false, reason: "hcx older than 0.1.3" };
-    }
+/** The hc-shape error hcx prints (`{"error":{"kind","message","hint"}}`), from
+ * stdout or stderr. Null when neither side parses to that shape. */
+function parseHcxError(stdout: string, stderr: string): { kind: string; message: string; hint: string } | null {
+  for (const side of [stdout, stderr]) {
+    const v = tryParseJson(side.trim());
+    if (!v) continue;
+    const err = v["error"];
+    if (typeof err !== "object" || err === null) continue;
+    const rec = err as Record<string, unknown>;
+    if (typeof rec["kind"] !== "string") continue;
+    return {
+      kind: rec["kind"] as string,
+      message: typeof rec["message"] === "string" ? (rec["message"] as string) : "",
+      hint: typeof rec["hint"] === "string" ? (rec["hint"] as string) : "",
+    };
   }
-  return hcxNoFooterResult;
+  return null;
 }
 
-/** Untagged send with no sender footer: `hcx send --no-footer`. Only called
- * when hcxNoFooter() says the installed hcx supports the flag. */
-function hcxNotify(target: string, text: string): HcResult {
+/** One `hcx send --agent-only --no-footer --json` attempt, argv with no
+ * shell. Heartbeats add `--if idle` so a busy agent is skipped; completion
+ * never uses `--if`. Never retries: a nonzero exit after the send may have
+ * landed. */
+function hcxNotify(target: string, text: string, ifIdle: boolean): NotifyResult {
+  const args = ["send", "--agent-only", "--no-footer", "--json"];
+  if (ifIdle) args.push("--if", "idle");
+  args.push(target, text);
+  let p: ReturnType<typeof spawnSync>;
   try {
-    const p = spawnSync("hcx", ["send", "--no-footer", target, text], { encoding: "utf8", timeout: 8000 });
-    if (p.status === 0) return { ok: true, detail: `notified ${target} via hcx send --no-footer`, reason: "" };
-    const err = (p.stderr as string).trim();
-    const reason = err === "" ? `exit ${p.status}` : err.split("\n")[0]!;
-    return { ok: false, detail: `hcx send to ${target} failed: ${reason}`, reason };
+    p = spawnSync("hcx", args, { encoding: "utf8", timeout: 8000 });
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
-    return { ok: false, detail: `hcx send to ${target} failed: ${reason}`, reason };
+    return {
+      outcome: "failed",
+      detail: `notify to ${target} failed: ${reason.split("\n")[0]} (never retried; the send may have landed)`,
+      route: null,
+      agent: null,
+      note: null,
+    };
   }
+  const stdout = (p.stdout as string) ?? "";
+  const stderr = (p.stderr as string) ?? "";
+  if (p.status === 0) {
+    const v = tryParseJson(stdout.trim());
+    if (v) {
+      const delivered = v["delivered"];
+      const route = typeof v["route"] === "string" ? (v["route"] as string) : null;
+      const agent = typeof v["agent"] === "string" ? (v["agent"] as string) : null;
+      const note = typeof v["note"] === "string" ? (v["note"] as string) : null;
+      if (delivered === true) {
+        return { outcome: "delivered", detail: `notified ${target} via hcx send --agent-only --no-footer`, route, agent, note };
+      }
+      if (delivered === false) {
+        const why = note ?? "did not start a turn; it may still have arrived, read before resending";
+        const who = agent ? ` (agent ${agent})` : "";
+        return {
+          outcome: "not_started",
+          detail: `notify to ${target} started no turn${who}: ${why} (do not resend)`,
+          route,
+          agent,
+          note,
+        };
+      }
+      if (delivered === null) {
+        const why = note ?? "hc reports no turn status";
+        const who = agent ? `agent ${agent}, ` : "";
+        return {
+          outcome: "unconfirmed",
+          detail: `notified ${target} (unconfirmed: ${who}${why}; never resend) via hcx send --agent-only --no-footer`,
+          route,
+          agent,
+          note,
+        };
+      }
+    }
+    const err = ((stderr as string) ?? "").trim();
+    const reason = err === "" ? `exit ${p.status}` : err.split("\n")[0]!;
+    return { outcome: "failed", detail: `notify to ${target} failed: ${reason} (never retried)`, route: null, agent: null, note: null };
+  }
+  const parsed = parseHcxError(stdout, stderr);
+  if (parsed !== null) {
+    const msg = parsed.message === "" ? parsed.kind : parsed.message;
+    const hint = parsed.hint === "" ? "" : ` (${parsed.hint})`;
+    if (parsed.kind === "plain_shell") {
+      return {
+        outcome: "plain_shell",
+        detail: `queued, not delivered: ${target} is a plain shell or unknown kind (${msg})${hint}`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
+    if (parsed.kind === "not_found") {
+      return {
+        outcome: "failed",
+        detail: `queued: target ${target} not found (${msg})${hint}`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
+    if (parsed.kind === "timeout") {
+      return {
+        outcome: "failed",
+        detail: `notify to ${target} failed: ${msg}${hint} (timed out; the message may have landed, never retry)`,
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
+    return {
+      outcome: "failed",
+      detail: `notify to ${target} failed: ${msg} (kind ${parsed.kind})${hint} (never retried; the send may have landed)`,
+      route: null,
+      agent: null,
+      note: null,
+    };
+  }
+  const errText = (stderr.trim() === "" ? stdout.trim() : stderr.trim()).split("\n")[0] ?? "";
+  const reason = errText === "" ? `exit ${p.status}` : errText;
+  return {
+    outcome: "failed",
+    detail: `notify to ${target} failed: ${reason} (never retried; the send may have landed)`,
+    route: null,
+    agent: null,
+    note: null,
+  };
 }
 
-/** Route over herdr-core: an agent target gets `hcx send --no-footer` (untagged,
- * no sender footer) when the installed hcx supports it. A shell kind, or a kind
- * that cannot be determined, keeps the tagged `hc send`, as does an hcx without
- * the flag (older or unreadable version): the raw text, or the flag read as
- * text, would run as a command in a shell prompt. A failed no-footer send falls
- * back to the tagged one, and the note names that fallback. */
-function hcRoute(target: string, text: string, hasHcx: boolean): string {
-  if (!hasHcx) return hcNotify(target, text);
-  const kind = hcTargetKind(target);
-  if (kind === "" || SHELLS.has(kind)) return hcNotify(target, text);
-  const support = hcxNoFooter();
-  if (!support.ok) return `${hcNotify(target, text)} (${support.reason})`;
-  const plain = hcxNotify(target, text);
-  if (plain.ok) return plain.detail;
-  const tagged = hcNotify(target, text);
-  if (tagged.startsWith("notified")) return `${tagged} (hcx failed: ${plain.reason})`;
-  return `${plain.detail}; ${tagged}`;
-}
-
-/** Send one notification turn. Returns a human-readable detail line. */
-export function notify(target: string, text: string): string {
-  if (target.trim() === "") return "skipped: no notify target (outside herdr and herdr-core, and no --notify)";
+/** Send one notification turn. Heartbeats pass `{ ifIdle: true }` so a busy
+ * agent is skipped (a skipped heartbeat is not a failure and is not
+ * retried); completion never uses `--if`. */
+export function notify(target: string, text: string, opts?: { ifIdle?: boolean }): NotifyResult {
+  const ifIdle = opts?.ifIdle === true;
+  if (target.trim() === "") {
+    return { outcome: "failed", detail: "skipped: no notify target (outside herdr and herdr-core, and no --notify)", route: null, agent: null, note: null };
+  }
   const herdr = haveHerdr();
-  const hc = haveHc();
-  const hcx = haveHcx();
-  if (!herdr && !hc && !hcx) return "skipped: herdr is not on PATH and neither hc nor hcx is on PATH";
+  const support = hcxSupport();
+  if (!herdr && !support.ok) {
+    if (/not on PATH/.test(support.reason)) {
+      return {
+        outcome: "failed",
+        detail: "skipped: herdr is not on PATH and hcx is not on PATH (install hcx >= 0.3.0)",
+        route: null,
+        agent: null,
+        note: null,
+      };
+    }
+    return {
+      outcome: "failed",
+      detail: `notify to ${target} not delivered: ${support.reason} (install hcx >= 0.3.0)`,
+      route: null,
+      agent: null,
+      note: null,
+    };
+  }
   if (herdr) {
     const done = herdrNotify(target, text);
-    if (done.startsWith("notified")) return done;
-    if (!hc && !hcx) return done;
-    const fallback = hcRoute(target, text, hcx);
-    if (fallback.startsWith("notified")) return fallback;
-    return `${done}; ${fallback}`;
+    if (done.outcome === "delivered") return done;
+    if (!support.ok) {
+      const hint = /not on PATH/.test(support.reason) ? "install hcx >= 0.3.0" : `${support.reason} (install hcx >= 0.3.0)`;
+      return { outcome: "failed", detail: `${done.detail}; ${hint}`, route: null, agent: null, note: null };
+    }
+    const fallback = hcxNotify(target, text, ifIdle);
+    if (fallback.outcome === "delivered" || fallback.outcome === "unconfirmed") return fallback;
+    return { outcome: "failed", detail: `${done.detail}; ${fallback.detail}`, route: fallback.route, agent: fallback.agent, note: fallback.note };
   }
-  return hcRoute(target, text, hcx);
+  return hcxNotify(target, text, ifIdle);
+}
+
+/** Warn when hcx cannot find an explicit `--notify` target. Returns the
+ * warning line, or null when the target looks fine. Never fails the run:
+ * the completion notify still reports the real result. */
+export function checkNotifyTarget(explicit: string | undefined): string | null {
+  if (explicit === undefined || explicit.trim() === "") return null;
+  const target = explicit.trim();
+  const support = hcxSupport();
+  if (!support.ok) return null;
+  if (haveHerdr()) return null;
+  try {
+    const p = spawnSync("hcx", ["get", target], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 8000 });
+    if (p.status === 0) return null;
+    const parsed = parseHcxError((p.stdout as string) ?? "", (p.stderr as string) ?? "");
+    const msg = parsed !== null && parsed.message !== "" ? parsed.message : (((p.stderr as string) ?? "").trim().split("\n")[0] ?? "");
+    const why = msg === "" ? `exit ${p.status}` : msg;
+    return `warning: hcx cannot find notify target "${target}" (${why}); the job still runs and the completion notify will report it`;
+  } catch {
+    return null;
+  }
 }

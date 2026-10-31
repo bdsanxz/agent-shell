@@ -53,6 +53,12 @@ export interface Status {
   duration_ms: number | null;
   notified: boolean;
   notify_detail: string;
+  /** Typed notify outcome: delivered | not_started | unconfirmed | plain_shell | failed ("" when no notify was attempted). */
+  notify_outcome: string;
+  /** Machine fields from `hcx send --json` when the send ran; null otherwise. */
+  notify_route: string | null;
+  notify_agent: string | null;
+  notify_note: string | null;
   /** Progress notifies sent while the job was running. */
   heartbeats: number;
   last_heartbeat_ms: number | null;
@@ -113,6 +119,10 @@ export function readStatus(dir: string): Status | null {
       last_heartbeat_ms: raw.last_heartbeat_ms ?? null,
       last_heartbeat_detail: raw.last_heartbeat_detail ?? "",
       error: raw.error ?? null,
+      notify_outcome: raw.notify_outcome ?? "",
+      notify_route: raw.notify_route ?? null,
+      notify_agent: raw.notify_agent ?? null,
+      notify_note: raw.notify_note ?? null,
     };
   } catch {
     return null;

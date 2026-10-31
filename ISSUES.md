@@ -15,3 +15,6 @@ Every issue reported against `agent-shell` is logged here first, then worked. Ne
 | 9 | 2026-10-31 | owner review | 0.2.3 | Exit codes mislead: `check` returns 0 for a failed job, `run --wait` always returns 0 (even on timeout), and "no notify target" fails the check. | Fixed in 0.2.4 |
 | 10 | 2026-10-31 | owner review | 0.2.3 | Non-atomic status/meta writes can expose an empty file; the supervisor abandons the child when the status is unreadable. | Fixed in 0.2.4 |
 | 11 | 2026-10-31 | owner review | 0.2.3 | `--tail abc` (non-integer) silently falls back to 30 instead of exiting 2. | Fixed in 0.2.4 |
+| 12 | 2026-10-31 | owner review | 0.2.4 | Notify delivery is never read: `delivered: false`/`null` from hcx becomes `notified`, kind detection is a drifted copy, and a tab-name `--notify` misses the live list so it falls back to tagged `hc send`. | Fixed in 0.3.0 |
+| 13 | 2026-10-31 | owner review | 0.2.4 | Progress heartbeats type into a busy agent instead of skipping when it is not idle; completion must never use `--if`. | Fixed in 0.3.0 |
+| 14 | 2026-10-31 | owner review | 0.2.4 | hcx is optional with a 0.1.3 baseline and an `hc send` fallback that can type into a plain shell; it should be required at 0.3.0 with a contract/capability check and typed notify outcomes. | Fixed in 0.3.0 |
