@@ -8,13 +8,15 @@ import { checkNotifyTarget, currentOwner, defaultTarget, notify, type NotifyResu
 import {
   defaultHeartbeatMs,
   freshId,
+  heartbeatMaxMs,
   jobDir,
   jobsDir,
   nowMs,
   readMeta,
   readStatus,
+  readTailDetailed,
+  sanitiseOutput,
   stateRoot,
-  tailLog,
   writeMeta,
   writeStatus,
   type Meta,
@@ -32,15 +34,19 @@ Commands:
   show       Show one job: status plus the tail of its output
   tail       Print the tail of one job's output
   check      Verify one finished job: state, exit, output and notify
-  kill       Stop a running job (SIGTERM, then SIGKILL)
-  clean      Remove finished job directories
+  kill       Stop a running job (process group SIGTERM, then SIGKILL)
+  clean      Remove finished and lost job directories
 
 How it works:
   1. agent-shell run --name build -- ./scripts/test.sh
-     returns at once with a job id; the command keeps running in background.
+     returns at once with a job id; the command keeps running in background
+     as the leader of its own process group, so kill stops grandchildren too.
   2. While it runs, your session gets one progress notify turn every 2 minutes
      (by default) with the last output line, so you can tell stuck from working.
      Disable with --no-heartbeat, change with --heartbeat <duration>.
+     When the output stops changing, notifies back off (doubling to 30m max,
+     env AGENT_SHELL_HEARTBEAT_MAX_MS; --heartbeat-fixed disables back-off);
+     the current interval shows in show. A dead supervisor reports state lost.
   3. When it finishes, your session gets one completion notify turn:
      shell job 'build' done (exit 0). Read with: agent-shell show <id>
   4. Read it with \`agent-shell show <id>\` or \`agent-shell tail <id>\`.
@@ -52,6 +58,8 @@ How it works:
 Environment:
   AGENT_SHELL_HOME   state root instead of ~/.local/cache/agent-shell
   XDG_CACHE_HOME     cache root holding agent-shell/ when AGENT_SHELL_HOME is unset
+  AGENT_SHELL_HEARTBEAT_MAX_MS   heartbeat back-off cap in ms (default 1800000)
+  AGENT_SHELL_DEFAULT_HEARTBEAT_MS   default heartbeat in ms (tests only)
 
 Exit codes:
   0  success
@@ -64,7 +72,7 @@ Examples:
   agent-shell show sh-1234-5678`,
   run: `agent-shell run — start a command in background, return its job id at once
 
-Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] [--wait <duration>] [--json] -- <command...>
+Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--heartbeat <duration> | --no-heartbeat] [--heartbeat-fixed] [--wait <duration>] [--json] -- <command...>
 
   --name <name>      Short job name (kebab-case, e.g. build, test-e2e). Default: job.
   --notify <target>  Who gets the notify turns: a herdr agent name, pane id, hc terminal
@@ -73,19 +81,25 @@ Usage: agent-shell run [--name <name>] [--notify <target>] [--cwd <dir>] [--hear
                      --json\` (needs hcx 0.3.0 or newer). Default: your own pane
                      ($HERDR_PANE_ID) or terminal ($HC_TERMINAL_ID).
   --cwd <dir>        Directory to run in. Default: current directory.
-  --heartbeat <d>    Progress notify interval with the last output line (e.g. 30s, 2m, 5m).
-                     Default: 2m. Minimum: 1s. Use 0 or off to disable.
+  --heartbeat <d>    Base progress notify interval with the last output line (e.g. 30s, 2m, 5m).
+                     Default: 2m. Minimum: 1s. Use 0 or off to disable. When the last
+                     output line is unchanged, the interval doubles up to 30m
+                     (env AGENT_SHELL_HEARTBEAT_MAX_MS) and resets on new output.
   --no-heartbeat     No progress notifies; only the completion notify is sent.
+  --heartbeat-fixed  Disable back-off; keep the base interval even when idle.
   --wait <d>         Wait up to <d> for the job to finish (e.g. 5s, 2m), print its
                      output and exit status, then exit with the job's exit code
                      (124 on timeout). Default: do not wait.
   <command...>       The command to run (after \`--\`); use \`sh -c '...'\` for shell features.
+                     It starts as the leader of its own process group (pgid in meta).
 
 Prints the job id and the notify target, then exits at once unless --wait is given.
+Job directories are 0700 and files 0600.
 
 With --json, stdout is one JSON object (no table, no prose):
 {"id","name","command","command_string","cwd","created_ms","created_at",
-"notify_target","notify_warning","heartbeat_ms","read_hint","wait"}
+"notify_target","notify_warning","heartbeat_ms","heartbeat_fixed",
+"heartbeat_current_ms","read_hint","wait"}
 "wait" is null without --wait, else {"wait_ms","timed_out","state",
 "exit_code","output"}.`,
   list: `agent-shell list — list jobs (running first, then newest done)
@@ -94,6 +108,9 @@ Usage: agent-shell list [--all] [--json]
 
   --all    Include all finished jobs (default: running plus the 20 newest).
   --json   Machine-readable JSON lines instead of the table (one object per line).
+
+States are running, done, failed, killed and lost (lost: the supervisor died
+without writing a final status; its partial output stays readable).
 
 With --json, stdout is JSON lines (this command keeps that shape, as documented):
 {"id","name","state","exit","exit_code","cmd","command","heartbeats",
@@ -104,20 +121,28 @@ Usage: agent-shell show <id> [--tail <n>] [--json]
 
   --tail <n>   Output lines to include. Default: 30.
 
+States are running, done, failed, killed and lost. Output is sanitised
+(CR progress bars collapsed, ANSI and control bytes stripped; the stored
+log stays raw) and bounded to the last 256 KiB (truncated reads are marked).
+
 With --json, stdout is one JSON object (no prose):
 {"id","name","command","command_string","cwd","created_ms","created_at",
 "state","exit_code","duration_ms","done_ms","done_at","error",
 "notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
-"heartbeat_ms","heartbeats","last_heartbeat_ms","last_heartbeat_at",
-"last_heartbeat_detail","tail_lines_requested","output","line_count"}.`,
+"heartbeat_ms","heartbeat_fixed","heartbeat_current_ms","heartbeats",
+"last_heartbeat_ms","last_heartbeat_at","last_heartbeat_detail",
+"tail_lines_requested","output","lines","line_count","truncated","pgid"}.`,
   tail: `agent-shell tail — print the tail of one job's output
 
 Usage: agent-shell tail <id> [--lines <n>] [--json]
 
   --lines <n>   Lines to print. Default: 50.
 
+Output is sanitised (CR collapsed, ANSI stripped; the stored log stays raw)
+and bounded to the last 256 KiB (truncated reads are marked).
+
 With --json, stdout is one JSON object (no prose):
-{"id","lines_requested","line_count","output","lines"}.`,
+{"id","lines_requested","line_count","output","lines","truncated"}.`,
   check: `agent-shell check — verify one finished job before using its result
 
 Usage: agent-shell check <id> [--json]
@@ -134,9 +159,11 @@ line, then a success line (the job's own outcome, separate from the records):
 
 Exit 0 only when all four record checks pass and the job succeeded
 (state done, exit 0); 1 when any record check fails or the job did not
-succeed; 2 when the job is unknown or still running. A killed job fails
-the finished check: its output is partial and it never got a completion
-notify. A job with no notify target prints "ok notify: n/a" (not a failure).
+succeed; 2 when the job is unknown or still running. A killed or lost job
+fails the finished check: its output is partial and it never got a completion
+notify (lost means the supervisor died; kill on lost only clears orphans).
+A job with no notify target prints "ok notify: n/a" (not a failure).
+Output shown is sanitised and bounded to the last 256 KiB.
 
 When progress notifies were sent, the last one prints as \`progress notify: ...\`
 after the notify line. It is informational and does not change the pass count.
@@ -145,24 +172,29 @@ With --json, stdout is one JSON object (no prose) with the same exit codes:
 {"id","state","exit_code","output_lines","output_ok","output_detail",
 "notify_detail","notify_outcome","notify_route","notify_agent","notify_note",
 "notify_ok","progress_notify","checks","pass","total","success","success_detail"}.`,
-  kill: `agent-shell kill — stop a running job (SIGTERM, then SIGKILL)
+  kill: `agent-shell kill — stop a running job (process group SIGTERM, then SIGKILL)
 
 Usage: agent-shell kill <id> [--json]
 
-Refuses with exit 2 unless the job state is running, leaving a finished
-job's result untouched. The child is only signalled when its process start
-time still matches the recorded start (no PID-reuse kill).
+Refuses with exit 2 unless the job state is running or lost, leaving a finished
+job's result untouched. The job runs as its own process group: kill signals
+the whole group (SIGTERM, then SIGKILL), so grandchildren of sh -c die too,
+but ONLY when the leader's process start time still matches the recorded
+start (no PID/group-reuse kill). When the leader is gone or reused, no
+negative-pid signal is ever sent; the job is marked lost with the hint
+"pgid <n> not signalled: its leader is gone" (orphans may remain).
+Kill on a lost job clears orphans only when the leader still matches.
 
 A killed job gets no completion notify; its partial output stays readable.
 
 With --json, stdout is one JSON object (no prose):
-{"id","state","signalled","detail"}.`,
-  clean: `agent-shell clean — remove finished job directories
+{"id","state","signalled","detail","done_ms","done_at"}.`,
+  clean: `agent-shell clean — remove finished and lost job directories
 
 Usage: agent-shell clean [--older-than <duration>] [--json]
 
   --older-than <d>   Only remove jobs finished this long ago or more (e.g. 24h, 7d).
-                     Default: remove all finished jobs. Running jobs are never removed.
+                     Default: remove all finished and lost jobs. Running jobs are never removed.
 
 With --json, stdout is one JSON object (no prose):
 {"removed","removed_ids"}.`,
@@ -209,12 +241,8 @@ function allJobs(root: string): { meta: Meta; status: Status | null }[] {
     const meta = readMeta(path.join(jobsDir(root), e.name));
     if (meta) out.push({ meta, status: readStatus(path.join(jobsDir(root), e.name)) });
   }
-  const rank = (s: string) => (s === "running" ? 0 : 1);
-  out.sort(
-    (a, b) =>
-      rank(a.status?.state ?? "") - rank(b.status?.state ?? "") ||
-      b.meta.created_ms - a.meta.created_ms,
-  );
+  const rank = (meta: Meta, status: Status | null) => (effectiveState(meta, status) === "running" ? 0 : 1);
+  out.sort((a, b) => rank(a.meta, a.status) - rank(b.meta, b.status) || b.meta.created_ms - a.meta.created_ms);
   return out;
 }
 
@@ -229,6 +257,61 @@ function iso(ms: number | null | undefined): string | null {
 
 function printJson(obj: unknown): void {
   console.log(JSON.stringify(obj));
+}
+
+/** True when a running job's supervisor is gone or reused: the job is lost. */
+function isLost(meta: Meta, status: Status | null): boolean {
+  if ((status?.state ?? "running") !== "running") return false;
+  const sup = meta.supervisor_pid;
+  if (sup === null || sup === undefined) return false;
+  return !pidMatches(sup, meta.supervisor_lstart);
+}
+
+/** Effective display state: "lost" when the supervisor died mid-run. */
+function effectiveState(meta: Meta, status: Status | null): string {
+  if (isLost(meta, status)) return "lost";
+  return status?.state ?? "running";
+}
+
+/** True when a process group still has members (`kill(-pgid, 0)` succeeds). */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Signal a whole process group; true when a signal was sent. */
+function signalGroup(pgid: number, sig: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pgid, sig);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Ensure a directory exists with 0700 (new roots are 0700; existing roots untouched). */
+function ensureDir0700(dir: string, isNewRoot: boolean, alwaysChmod: boolean): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (alwaysChmod || isNewRoot) {
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+function writeFile0600(file: string, text: string): void {
+  fs.writeFileSync(file, text);
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // best effort
+  }
 }
 
 function cmdList(argv: string[]): number {
@@ -248,7 +331,7 @@ function cmdList(argv: string[]): number {
       printJson({
         id: meta.id,
         name: meta.name,
-        state: status?.state ?? "running",
+        state: effectiveState(meta, status),
         exit: status?.exit_code ?? null,
         exit_code: status?.exit_code ?? null,
         cmd: meta.command.join(" "),
@@ -270,7 +353,7 @@ function cmdList(argv: string[]): number {
   console.log(`${"ID".padEnd(22)} ${"NAME".padEnd(12)} ${"STATE".padEnd(8)} COMMAND`);
   for (const { meta, status } of jobs) {
     console.log(
-      `${meta.id.padEnd(22)} ${meta.name.padEnd(12)} ${(status?.state ?? "running").padEnd(8)} ${meta.command.join(" ")}`,
+      `${meta.id.padEnd(22)} ${meta.name.padEnd(12)} ${effectiveState(meta, status).padEnd(8)} ${meta.command.join(" ")}`,
     );
   }
   return 0;
@@ -301,8 +384,13 @@ function cmdShow(argv: string[]): number {
   const meta = readMeta(dir);
   if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
   const status = readStatus(dir);
+  const state = effectiveState(meta, status);
+  const hbBase = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
+  const hbFixed = meta.heartbeat_fixed ?? false;
+  const hbCurrent = status?.heartbeat_current_ms ?? hbBase;
   if (wantsJson(p)) {
-    const out = tailLog(dir, tail);
+    const raw = readTailDetailed(dir, tail);
+    const out = sanitiseOutput(raw.text);
     const lines = out === "" ? [] : out.split("\n");
     printJson({
       id: meta.id,
@@ -312,7 +400,7 @@ function cmdShow(argv: string[]): number {
       cwd: meta.cwd,
       created_ms: meta.created_ms,
       created_at: iso(meta.created_ms),
-      state: status?.state ?? "running",
+      state,
       exit_code: status?.exit_code ?? null,
       duration_ms: status?.duration_ms ?? null,
       done_ms: status?.done_ms ?? null,
@@ -323,7 +411,9 @@ function cmdShow(argv: string[]): number {
       notify_route: status?.notify_route ?? null,
       notify_agent: status?.notify_agent ?? null,
       notify_note: status?.notify_note ?? null,
-      heartbeat_ms: meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms,
+      heartbeat_ms: hbBase,
+      heartbeat_fixed: hbFixed,
+      heartbeat_current_ms: hbCurrent,
       heartbeats: status?.heartbeats ?? 0,
       last_heartbeat_ms: status?.last_heartbeat_ms ?? null,
       last_heartbeat_at: iso(status?.last_heartbeat_ms ?? null),
@@ -332,6 +422,8 @@ function cmdShow(argv: string[]): number {
       output: out,
       lines,
       line_count: lines.length,
+      truncated: raw.truncated,
+      pgid: meta.pgid ?? null,
     });
     return 0;
   }
@@ -339,7 +431,8 @@ function cmdShow(argv: string[]): number {
   console.log(`name ${meta.name}`);
   console.log(`command ${meta.command.join(" ")}`);
   console.log(`cwd ${meta.cwd}`);
-  console.log(`state ${status?.state ?? "running"}`);
+  console.log(`state ${state}`);
+  if (state === "lost") console.log(`lost: supervisor died without writing a final status`);
   if (status?.exit_code !== null && status?.exit_code !== undefined) console.log(`exit ${status.exit_code}`);
   if (status?.duration_ms !== null && status?.duration_ms !== undefined)
     console.log(`duration_ms ${status.duration_ms}`);
@@ -349,12 +442,14 @@ function cmdShow(argv: string[]): number {
   if (status?.notify_route) console.log(`notify_route ${status.notify_route}`);
   if (status?.notify_agent) console.log(`notify_agent ${status.notify_agent}`);
   if (status?.notify_note) console.log(`notify_note ${status.notify_note}`);
-  const hb = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
-  console.log(`heartbeat ${hb === null ? "off" : `${hb}ms`}`);
+  console.log(`heartbeat ${hbBase === null ? "off" : `${hbBase}ms`}`);
+  if (hbBase !== null) console.log(`heartbeat_current ${hbCurrent === null ? "off" : `${hbCurrent}ms`}`);
   if ((status?.heartbeats ?? 0) > 0) console.log(`heartbeats ${status!.heartbeats}`);
   if (status?.last_heartbeat_detail) console.log(`last_heartbeat ${status.last_heartbeat_detail}`);
   console.log(`--- output (last ${tail} lines) ---`);
-  const out = tailLog(dir, tail);
+  const rawTail = readTailDetailed(dir, tail);
+  if (rawTail.truncated) console.log(`(output truncated at 256 KiB)`);
+  const out = sanitiseOutput(rawTail.text);
   if (out !== "") console.log(out);
   return 0;
 }
@@ -372,12 +467,14 @@ function cmdTail(argv: string[]): number {
   const lines = parseCount(str(p, "lines"), 50, "lines");
   const dir = jobDir(stateRoot(), id);
   if (!readMeta(dir)) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
-  const out = tailLog(dir, lines);
+  const raw = readTailDetailed(dir, lines);
+  const out = sanitiseOutput(raw.text);
   if (wantsJson(p)) {
     const arr = out === "" ? [] : out.split("\n");
-    printJson({ id, lines_requested: lines, line_count: arr.length, output: out, lines: arr });
+    printJson({ id, lines_requested: lines, line_count: arr.length, output: out, lines: arr, truncated: raw.truncated });
     return 0;
   }
+  if (raw.truncated) console.log(`(output truncated at 256 KiB)`);
   if (out !== "") console.log(out);
   return 0;
 }
@@ -396,7 +493,7 @@ function cmdCheck(argv: string[]): number {
   const meta = readMeta(dir);
   if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
   const status = readStatus(dir);
-  const state = status?.state ?? "running";
+  const state = effectiveState(meta, status);
   if (state === "running")
     throw new UsageError(
       `job ${id} is still running; check it after its notify turn arrives`,
@@ -407,22 +504,37 @@ function cmdCheck(argv: string[]): number {
   const finishedDetail =
     state === "killed"
       ? "finished: state is killed (partial output kept, no completion notify)"
-      : `finished: state is ${state}`;
+      : state === "lost"
+        ? "finished: state is lost (supervisor died without writing a final status; partial output kept, no completion notify)"
+        : `finished: state is ${state}`;
   const code = status?.exit_code;
   const exitOk = code !== null && code !== undefined;
   const exitDetail = exitOk ? `exit: ${code}` : "exit: no exit code recorded";
-  const logPath = path.join(dir, "output.log");
   let lines: string[] | null = null;
+  let truncated = false;
   try {
-    const text = fs.readFileSync(logPath, "utf8");
-    const all = text.split("\n");
-    if (all.length > 0 && all[all.length - 1] === "") all.pop();
-    lines = all;
+    fs.statSync(path.join(dir, "output.log"));
+    const raw = readTailDetailed(dir, 1000000);
+    truncated = raw.truncated;
+    const clean = sanitiseOutput(raw.text);
+    const all = clean.split("\n");
+    if (all.length === 1 && all[0] === "") lines = [];
+    else {
+      if (all.length > 0 && all[all.length - 1] === "") all.pop();
+      lines = all;
+    }
   } catch {
-    lines = null;
+    try {
+      fs.statSync(path.join(dir, "output.log"));
+      lines = [];
+    } catch {
+      lines = null;
+    }
   }
   const outputOk = lines !== null;
-  const outputDetail = outputOk ? `output: ${lines!.length} lines` : "output: output.log is missing or unreadable";
+  const outputDetail = outputOk
+    ? `output: ${lines!.length} lines${truncated ? " (truncated at 256 KiB)" : ""}`
+    : "output: output.log is missing or unreadable";
   const detail = status?.notify_detail ?? "";
   const noTarget = detail.includes("no notify target") || (meta.notify_target ?? "") === "";
   let notifyOk: boolean;
@@ -466,6 +578,7 @@ function cmdCheck(argv: string[]): number {
       output_lines: lines === null ? null : lines.length,
       output_ok: outputOk,
       output_detail: outputDetail,
+      truncated,
       notify_detail: detail,
       notify_outcome: status?.notify_outcome ?? "",
       notify_route: status?.notify_route ?? null,
@@ -544,63 +657,213 @@ function cmdKill(argv: string[]): number {
   const meta = readMeta(dir);
   if (!meta) throw new UsageError(`unknown job ${id}`, "not_found", "run agent-shell list to see job ids");
   const status = readStatus(dir);
-  const state = status?.state ?? "running";
-  if (state !== "running")
+  const state = effectiveState(meta, status);
+  if (state !== "running" && state !== "lost")
     throw new UsageError(
       `job ${id} is not running (state is ${state}); refusing to kill a finished job`,
       "not_running",
       "use agent-shell show to read its result",
     );
-  let killed = false;
-  const targets: Array<{ pid: number | null | undefined; stored: string | null | undefined }> = [
-    { pid: meta.child_pid, stored: meta.child_lstart },
-    { pid: meta.supervisor_pid, stored: meta.supervisor_lstart },
-  ];
-  for (const t of targets) {
-    if (t.pid === null || t.pid === undefined) continue;
-    if (!pidMatches(t.pid, t.stored)) continue;
-    try {
-      process.kill(t.pid, "SIGTERM");
-      killed = true;
-    } catch {
-      // already gone
-    }
-  }
-  const t0 = Date.now();
-  while (Date.now() - t0 < 500) {
-    if (
-      targets.every((t) => {
-        if (t.pid === null || t.pid === undefined) return true;
-        if (!pidMatches(t.pid, t.stored)) return true;
-        try {
-          process.kill(t.pid, 0);
-          return false;
-        } catch {
-          return true;
-        }
-      })
-    )
-      break;
-    Bun.sleepSync(50);
-  }
-  for (const t of targets) {
-    if (t.pid === null || t.pid === undefined) continue;
-    if (!pidMatches(t.pid, t.stored)) continue;
-    try {
-      process.kill(t.pid, 0);
+  const pgid = meta.pgid ?? meta.child_pid ?? null;
+  const leaderPid = meta.child_pid;
+  const leaderMatches =
+    leaderPid !== null && leaderPid !== undefined && pidMatches(leaderPid, meta.child_lstart);
+  const supMatches =
+    meta.supervisor_pid !== null &&
+    meta.supervisor_pid !== undefined &&
+    pidMatches(meta.supervisor_pid, meta.supervisor_lstart);
+  let signalled = false;
+  // Hardening: signal -pgid ONLY when the leader still matches. A gone or
+  // reused leader PID must never trigger a group signal, even if some group
+  // with that number still exists.
+  const termGroupMatching = (): void => {
+    if (pgid === null || pgid === undefined) return;
+    if (!leaderMatches) return;
+    if (signalGroup(pgid, "SIGTERM")) signalled = true;
+    else {
       try {
-        process.kill(t.pid, "SIGKILL");
+        process.kill(leaderPid as number, "SIGTERM");
+        signalled = true;
       } catch {
         // gone
       }
-      killed = true;
+    }
+  };
+  const killGroupMatching = (): void => {
+    if (pgid === null || pgid === undefined) return;
+    if (!leaderMatches) return;
+    try {
+      process.kill(-(pgid as number), 0);
+      if (signalGroup(pgid as number, "SIGKILL")) signalled = true;
+    } catch {
+      try {
+        process.kill(leaderPid as number, 0);
+        try {
+          process.kill(leaderPid as number, "SIGKILL");
+          signalled = true;
+        } catch {
+          // gone
+        }
+      } catch {
+        // gone
+      }
+    }
+  };
+  const stopSupervisor = (): void => {
+    if (!supMatches) return;
+    try {
+      process.kill(meta.supervisor_pid as number, "SIGTERM");
+      signalled = true;
     } catch {
       // gone
     }
+  };
+  const stopSupervisorKill = (): void => {
+    if (!supMatches) return;
+    try {
+      process.kill(meta.supervisor_pid as number, 0);
+      try {
+        process.kill(meta.supervisor_pid as number, "SIGKILL");
+        signalled = true;
+      } catch {
+        // gone
+      }
+    } catch {
+      // gone
+    }
+  };
+  const writeLost = (detail: string): void => {
+    const prev = readStatus(dir);
+    writeStatus(dir, {
+      state: "lost",
+      exit_code: null,
+      done_ms: null,
+      duration_ms: null,
+      notified: false,
+      notify_detail: detail,
+      notify_outcome: "",
+      notify_route: null,
+      notify_agent: null,
+      notify_note: null,
+      heartbeats: prev?.heartbeats ?? 0,
+      last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
+      last_heartbeat_detail: prev?.last_heartbeat_detail ?? detail,
+      error: prev?.error ?? null,
+      heartbeat_current_ms: prev?.heartbeat_current_ms ?? null,
+    });
+  };
+  if (state === "lost") {
+    if (leaderMatches) {
+      termGroupMatching();
+      const t0 = Date.now();
+      while (Date.now() - t0 < 500) {
+        if (pgid === null || pgid === undefined || !groupAlive(pgid)) break;
+        Bun.sleepSync(50);
+      }
+      killGroupMatching();
+      const detail = signalled ? "supervisor died; orphan group members removed" : "supervisor died; no live group members";
+      writeLost(detail);
+      if (wantsJson(p)) {
+        printJson({ id, state: "lost", signalled, detail, done_ms: null, done_at: null });
+        return 0;
+      }
+      console.log(`lost ${id}`);
+      return 0;
+    }
+    const detail =
+      pgid === null || pgid === undefined
+        ? "supervisor died; no group to signal"
+        : `pgid ${pgid} not signalled: its leader is gone; supervisor died`;
+    writeLost(detail);
+    if (wantsJson(p)) {
+      printJson({ id, state: "lost", signalled: false, detail, done_ms: null, done_at: null });
+      return 0;
+    }
+    console.log(`lost ${id}`);
+    console.log(detail);
+    return 0;
   }
+  if (!leaderMatches) {
+    if (leaderPid === null || leaderPid === undefined) {
+      stopSupervisor();
+      const t0e = Date.now();
+      while (Date.now() - t0e < 500) {
+        let supGone = true;
+        if (supMatches) {
+          try {
+            process.kill(meta.supervisor_pid as number, 0);
+            supGone = false;
+          } catch {
+            supGone = true;
+          }
+        }
+        if (supGone) break;
+        Bun.sleepSync(50);
+      }
+      stopSupervisorKill();
+      const prevE = readStatus(dir);
+      const doneMsE = nowMs();
+      const detailE = signalled ? "killed by user; no completion notify" : "no live process found";
+      writeStatus(dir, {
+        state: "killed",
+        exit_code: null,
+        done_ms: doneMsE,
+        duration_ms: null,
+        notified: false,
+        notify_detail: detailE,
+        notify_outcome: "",
+        notify_route: null,
+        notify_agent: null,
+        notify_note: null,
+        heartbeats: prevE?.heartbeats ?? 0,
+        last_heartbeat_ms: prevE?.last_heartbeat_ms ?? null,
+        last_heartbeat_detail: prevE?.last_heartbeat_detail ?? "",
+        error: prevE?.error ?? null,
+        heartbeat_current_ms: prevE?.heartbeat_current_ms ?? null,
+      });
+      if (wantsJson(p)) {
+        printJson({ id, state: "killed", signalled, detail: detailE, done_ms: doneMsE, done_at: iso(doneMsE) });
+        return 0;
+      }
+      console.log(`killed ${id}`);
+      return 0;
+    }
+    stopSupervisor();
+    const detail =
+      pgid === null || pgid === undefined
+        ? "not signalled: its leader is gone (no group recorded)"
+        : `pgid ${pgid} not signalled: its leader is gone`;
+    writeLost(detail);
+    if (wantsJson(p)) {
+      printJson({ id, state: "lost", signalled: false, detail, done_ms: null, done_at: null });
+      return 0;
+    }
+    console.log(`lost ${id}`);
+    console.log(detail);
+    return 0;
+  }
+  termGroupMatching();
+  stopSupervisor();
+  const t0 = Date.now();
+  while (Date.now() - t0 < 500) {
+    const groupGone = pgid === null || pgid === undefined || !groupAlive(pgid);
+    let supGone = true;
+    if (supMatches) {
+      try {
+        process.kill(meta.supervisor_pid as number, 0);
+        supGone = false;
+      } catch {
+        supGone = true;
+      }
+    }
+    if (groupGone && supGone) break;
+    Bun.sleepSync(50);
+  }
+  killGroupMatching();
+  stopSupervisorKill();
   const prev = readStatus(dir);
   const doneMs = nowMs();
-  const detail = killed ? "killed by user; no completion notify" : "no live process found";
+  const detail = signalled ? "killed by user; no completion notify" : "no live process found";
   writeStatus(dir, {
     state: "killed",
     exit_code: null,
@@ -616,9 +879,10 @@ function cmdKill(argv: string[]): number {
     last_heartbeat_ms: prev?.last_heartbeat_ms ?? null,
     last_heartbeat_detail: prev?.last_heartbeat_detail ?? "",
     error: prev?.error ?? null,
+    heartbeat_current_ms: prev?.heartbeat_current_ms ?? null,
   });
   if (wantsJson(p)) {
-    printJson({ id, state: "killed", signalled: killed, detail, done_ms: doneMs, done_at: iso(doneMs) });
+    printJson({ id, state: "killed", signalled, detail, done_ms: doneMs, done_at: iso(doneMs) });
     return 0;
   }
   console.log(`killed ${id}`);
@@ -640,7 +904,7 @@ function cmdClean(argv: string[]): number {
   let removed = 0;
   const removedIds: string[] = [];
   for (const { meta, status } of allJobs(root)) {
-    if ((status?.state ?? "running") === "running") continue;
+    if (effectiveState(meta, status) === "running") continue;
     if (cutoff !== null) {
       const done = status?.done_ms ?? meta.created_ms;
       if (done > cutoff) continue;
@@ -678,9 +942,11 @@ function parseHeartbeatMs(raw: string | undefined, disabled: boolean): number | 
   return ms;
 }
 
-/** Last non-empty line of the job log ("" when nothing yet). */
+/** Last non-empty sanitised line of the job log ("" when nothing yet). Bounded. */
 function lastOutputLine(dir: string): string {
-  return tailLog(dir, 5).split("\n").filter((l) => l.trim() !== "").pop() ?? "";
+  const raw = readTailDetailed(dir, 20).text;
+  const clean = sanitiseOutput(raw);
+  return clean.split("\n").filter((l) => l.trim() !== "").pop() ?? "";
 }
 
 /** Status fields for a notify result: `notified` is true for delivered or
@@ -746,8 +1012,8 @@ function resolveExecutable(cmd: string): string | null {
 }
 
 async function cmdRun(argv: string[]): Promise<number> {
-  const p = parseArgs(argv, ["no-heartbeat", "json"]);
-  unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat", "wait", "json"]);
+  const p = parseArgs(argv, ["no-heartbeat", "heartbeat-fixed", "json"]);
+  unknownFlags(p, ["name", "notify", "cwd", "heartbeat", "no-heartbeat", "heartbeat-fixed", "wait", "json"]);
   if (bool(p, "help")) {
     console.log(HELP["run"]);
     return 0;
@@ -755,6 +1021,7 @@ async function cmdRun(argv: string[]): Promise<number> {
   if (p.positionals.length === 0)
     throw new UsageError("run needs a command after `--`", "usage", "run agent-shell run -- -- <command> for usage");
   const heartbeatMs = parseHeartbeatMs(str(p, "heartbeat"), bool(p, "no-heartbeat"));
+  const heartbeatFixed = bool(p, "heartbeat-fixed");
   const waitRaw = str(p, "wait");
   const waitMs = waitRaw === undefined ? undefined : parseDurationMs(waitRaw.trim());
   const cwd = str(p, "cwd") ?? process.cwd();
@@ -769,9 +1036,13 @@ async function cmdRun(argv: string[]): Promise<number> {
   if (resolveExecutable(exe) === null)
     throw new UsageError(`cannot start '${exe}': executable not found on PATH`, "not_found", "check the command name or install it");
   const root = stateRoot();
+  const rootExisted = fs.existsSync(root);
+  const jobsExisted = fs.existsSync(jobsDir(root));
   const id = freshId(root);
   const dir = jobDir(root, id);
-  fs.mkdirSync(dir, { recursive: true });
+  ensureDir0700(root, !rootExisted, false);
+  ensureDir0700(jobsDir(root), !jobsExisted, false);
+  ensureDir0700(dir, true, true);
   const owner = currentOwner();
   const target = defaultTarget(str(p, "notify"), owner);
   const meta: Meta = {
@@ -787,6 +1058,8 @@ async function cmdRun(argv: string[]): Promise<number> {
     supervisor_pid: null,
     child_lstart: null,
     supervisor_lstart: null,
+    pgid: null,
+    heartbeat_fixed: heartbeatFixed,
   };
   writeMeta(dir, meta);
   writeStatus(dir, {
@@ -804,8 +1077,9 @@ async function cmdRun(argv: string[]): Promise<number> {
     last_heartbeat_ms: null,
     last_heartbeat_detail: "",
     error: null,
+    heartbeat_current_ms: heartbeatMs,
   });
-  fs.writeFileSync(path.join(dir, "output.log"), "");
+  writeFile0600(path.join(dir, "output.log"), "");
   spawnSupervisor(id);
   const notifyWarning = checkNotifyTarget(str(p, "notify"));
   const heartbeatLabel = heartbeatMs === null ? "off" : `every ${formatElapsed(heartbeatMs)}`;
@@ -835,6 +1109,8 @@ async function cmdRun(argv: string[]): Promise<number> {
         notify_target: target,
         notify_warning: notifyWarning,
         heartbeat_ms: heartbeatMs,
+        heartbeat_fixed: heartbeatFixed,
+        heartbeat_current_ms: heartbeatMs,
         heartbeat: heartbeatLabel,
         read_hint: readHint,
         wait: null,
@@ -844,11 +1120,12 @@ async function cmdRun(argv: string[]): Promise<number> {
   }
   const deadline = Date.now() + waitMs;
   let status = readStatus(dir);
-  while ((status?.state ?? "running") === "running" && Date.now() < deadline) {
+  while (effectiveState(meta, status) === "running" && Date.now() < deadline) {
     await Bun.sleep(200);
     status = readStatus(dir);
   }
-  if ((status?.state ?? "running") === "running") {
+  const waitState = effectiveState(meta, status);
+  if (waitState === "running") {
     if (json) {
       printJson({
         id,
@@ -861,6 +1138,8 @@ async function cmdRun(argv: string[]): Promise<number> {
         notify_target: target,
         notify_warning: notifyWarning,
         heartbeat_ms: heartbeatMs,
+        heartbeat_fixed: heartbeatFixed,
+        heartbeat_current_ms: status?.heartbeat_current_ms ?? heartbeatMs,
         heartbeat: heartbeatLabel,
         read_hint: readHint,
         wait: { wait_ms: waitMs, timed_out: true, state: "running", exit_code: null, output: "" },
@@ -870,7 +1149,7 @@ async function cmdRun(argv: string[]): Promise<number> {
     console.log(`still running after ${formatElapsed(waitMs)}; read with: agent-shell show ${id}`);
     return 124;
   }
-  const out = tailLog(dir, 30);
+  const out = sanitiseOutput(readTailDetailed(dir, 30).text);
   const code = status?.exit_code;
   const finalCode =
     typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255 ? code : 1;
@@ -886,12 +1165,14 @@ async function cmdRun(argv: string[]): Promise<number> {
       notify_target: target,
       notify_warning: notifyWarning,
       heartbeat_ms: heartbeatMs,
+      heartbeat_fixed: heartbeatFixed,
+      heartbeat_current_ms: status?.heartbeat_current_ms ?? heartbeatMs,
       heartbeat: heartbeatLabel,
       read_hint: readHint,
       wait: {
         wait_ms: waitMs,
         timed_out: false,
-        state: status?.state ?? "running",
+        state: waitState,
         exit_code: code ?? null,
         output: out,
       },
@@ -936,15 +1217,29 @@ async function supervise(id: string): Promise<number> {
   writeMeta(dir, meta);
   const started = nowMs();
   const heartbeatMs = meta.heartbeat_ms === undefined ? defaultHeartbeatMs() : meta.heartbeat_ms;
+  const heartbeatFixed = meta.heartbeat_fixed ?? false;
+  const heartbeatCap = heartbeatMaxMs();
+  let currentInterval: number | null = heartbeatMs;
   const logPath = path.join(dir, "output.log");
   const logFd = fs.openSync(logPath, "a");
-  let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(meta.command, {
+    fs.chmodSync(logPath, 0o600);
+  } catch {
+    // best effort
+  }
+  let child: ReturnType<typeof spawn> | null = null;
+  try {
+    const st = fs.statSync(meta.cwd);
+    if (!st.isDirectory()) throw new Error(`bad cwd '${meta.cwd}': not a directory`);
+    if (resolveExecutable(meta.command[0] as string) === null)
+      throw new Error(`executable not found '${meta.command[0]}'`);
+    child = spawn(meta.command[0] as string, meta.command.slice(1), {
       cwd: meta.cwd,
-      stdin: "ignore",
-      stdout: logFd,
-      stderr: logFd,
+      stdio: ["ignore", logFd, logFd],
+      detached: true,
+    });
+    child.on("error", () => {
+      // Handled via exitPromise; prevent an uncaught 'error' crash.
     });
   } catch (e) {
     fs.closeSync(logFd);
@@ -966,11 +1261,12 @@ async function supervise(id: string): Promise<number> {
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
+      heartbeat_current_ms: heartbeatMs,
     });
     const text = `shell job '${meta.name}' failed to start: ${msg}. Read with: agent-shell show ${meta.id}`;
     const result = notify(meta.notify_target, text);
     const cur = readStatus(dir);
-    if (cur && cur.state === "killed") return 0;
+    if (cur && (cur.state === "killed" || cur.state === "lost")) return 0;
     writeStatus(dir, {
       state: "failed",
       exit_code: -1,
@@ -981,11 +1277,31 @@ async function supervise(id: string): Promise<number> {
       last_heartbeat_ms: null,
       last_heartbeat_detail: "",
       error: startError,
+      heartbeat_current_ms: heartbeatMs,
     });
     return 0;
   }
-  meta.child_pid = proc.pid;
-  meta.child_lstart = procStartTime(proc.pid);
+  if (!child || child.pid === undefined) {
+    fs.closeSync(logFd);
+    const startError = `could not start '${meta.command.join(" ")}': spawn failed`;
+    const failedAt = nowMs();
+    writeStatus(dir, {
+      state: "failed",
+      exit_code: -1,
+      done_ms: failedAt,
+      duration_ms: failedAt - started,
+      ...statusFromNotify(notify(meta.notify_target, `shell job '${meta.name}' failed to start. Read with: agent-shell show ${meta.id}`)),
+      heartbeats: 0,
+      last_heartbeat_ms: null,
+      last_heartbeat_detail: "",
+      error: startError,
+      heartbeat_current_ms: heartbeatMs,
+    });
+    return 0;
+  }
+  meta.child_pid = child.pid;
+  meta.child_lstart = procStartTime(child.pid);
+  meta.pgid = child.pid;
   writeMeta(dir, meta);
 
   let heartbeats = 0;
@@ -993,36 +1309,77 @@ async function supervise(id: string): Promise<number> {
   let lastHeartbeatDetail = "";
   let finished = false;
   let exitCode: number | undefined;
-  proc.exited.then(
-    (c) => {
+  const exitPromise = new Promise<number>((resolve) => {
+    let settled = false;
+    const done = (code: number): void => {
+      if (settled) return;
+      settled = true;
       finished = true;
-      exitCode = c;
-    },
-    () => {
-      finished = true;
-    },
-  );
+      exitCode = code;
+      resolve(code);
+    };
+    child!.on("error", () => done(-1));
+    child!.on("exit", (code: number | null) => {
+      if (code !== null && code !== undefined) done(code);
+      else done(1);
+    });
+  });
 
   // Progress notifies while the command runs: last output line every heartbeatMs,
   // via `hcx send --if idle` so a busy agent is skipped (a skipped heartbeat
   // is not a failure and is not retried). Completion never uses `--if`.
-  // Skipped entirely when disabled or when there is no notify target.
+  // When the last line is unchanged and back-off is enabled, skip the notify
+  // and double the interval up to the cap; reset on new output. Skipped
+  // heartbeats are not failures. Skipped entirely when disabled or no target.
   // The wait races the heartbeat interval against process exit, so a job
   // shorter than the interval finishes at once with no progress notify.
   // An unreadable status (null) is not "not running": keep supervising.
   if (heartbeatMs !== null && meta.notify_target !== "") {
-    const done = proc.exited.then(
+    const done = exitPromise.then(
       () => {},
       () => {},
     );
+    let prevLine: string | null = null;
+    let unchangedStreak = 0;
     for (;;) {
-      await Promise.race([done, Bun.sleep(heartbeatMs)]);
+      await Promise.race([done, Bun.sleep(currentInterval as number)]);
       if (finished) break;
-      if ((proc.exitCode ?? null) !== null) break;
       const cur = readStatus(dir);
       if (cur && cur.state !== "running") return 0;
       const elapsed = nowMs() - started;
       const last = lastOutputLine(dir);
+      if (!heartbeatFixed && prevLine !== null && last === prevLine) {
+        unchangedStreak++;
+        const next = Math.min((currentInterval as number) * 2, heartbeatCap);
+        currentInterval = next;
+        if (unchangedStreak >= 2) {
+          lastHeartbeatMs = nowMs();
+          lastHeartbeatDetail = `skipped: no new output (next heartbeat in ${formatElapsed(next)})`;
+          writeStatus(dir, {
+            state: "running",
+            exit_code: null,
+            done_ms: null,
+            duration_ms: null,
+            notified: false,
+            notify_detail: "",
+            notify_outcome: "",
+            notify_route: null,
+            notify_agent: null,
+            notify_note: null,
+            heartbeats,
+            last_heartbeat_ms: lastHeartbeatMs,
+            last_heartbeat_detail: lastHeartbeatDetail,
+            error: null,
+            heartbeat_current_ms: currentInterval,
+          });
+          if (finished) break;
+          continue;
+        }
+      } else {
+        unchangedStreak = 0;
+        currentInterval = heartbeatMs;
+      }
+      prevLine = last;
       const hbText =
         `shell job '${meta.name}' still running (${formatElapsed(elapsed)} elapsed). ` +
         (last !== "" ? `Last line: ${last.slice(0, 160)}. ` : `No output yet. `) +
@@ -1046,16 +1403,17 @@ async function supervise(id: string): Promise<number> {
         last_heartbeat_ms: lastHeartbeatMs,
         last_heartbeat_detail: lastHeartbeatDetail,
         error: null,
+        heartbeat_current_ms: currentInterval,
       });
       if (finished) break;
     }
   }
 
-  const code = exitCode ?? (await proc.exited);
+  const code = exitCode ?? (await exitPromise);
   fs.closeSync(logFd);
-  // A kill that landed while the child exited wins: keep the killed state.
+  // A kill that landed while the child exited wins: keep the killed/lost state.
   const cur = readStatus(dir);
-  if (cur && cur.state === "killed") return 0;
+  if (cur && (cur.state === "killed" || cur.state === "lost")) return 0;
   const done = nowMs();
   // Record the final state BEFORE notifying, so a receiver that wakes early
   // never sees "still running". The notify result is filled in afterwards.
@@ -1075,6 +1433,7 @@ async function supervise(id: string): Promise<number> {
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
     error: null,
+    heartbeat_current_ms: currentInterval,
   });
   const lastLine = lastOutputLine(dir);
   const secs = ((done - started) / 1000).toFixed(1);
@@ -1082,7 +1441,7 @@ async function supervise(id: string): Promise<number> {
   if (lastLine !== "") text += ` Last line: ${lastLine.slice(0, 160)}`;
   const result = notify(meta.notify_target, text);
   const raced = readStatus(dir);
-  if (raced && raced.state === "killed") return 0;
+  if (raced && (raced.state === "killed" || raced.state === "lost")) return 0;
   writeStatus(dir, {
     state: finalState,
     exit_code: code,
@@ -1093,6 +1452,7 @@ async function supervise(id: string): Promise<number> {
     last_heartbeat_ms: lastHeartbeatMs,
     last_heartbeat_detail: lastHeartbeatDetail,
     error: null,
+    heartbeat_current_ms: currentInterval,
   });
   return 0;
 }

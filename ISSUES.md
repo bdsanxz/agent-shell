@@ -20,3 +20,10 @@ Every issue reported against `agent-shell` is logged here first, then worked. Ne
 | 14 | 2026-10-31 | owner review | 0.2.4 | hcx is optional with a 0.1.3 baseline and an `hc send` fallback that can type into a plain shell; it should be required at 0.3.0 with a contract/capability check and typed notify outcomes. | Fixed in 0.3.0 |
 | 15 | 2026-10-31 | owner review | 0.3.0 | Every command needs machine-readable `--json` output (single JSON document, snake_case fields, typed error kinds) so agents do not parse human prose; `--help` must document each shape. | Fixed in 0.4.0 |
 | 16 | 2026-10-31 | owner review | 0.3.0 | `install.sh` lags behind `hcx/install.sh`: the token appears on the curl command line, there is no `shasum` fallback, `--from-source` only dies, and there is no `--force` symlink guard. | Fixed in 0.4.0 |
+| 17 | 2026-10-31 | owner review | 0.4.0 | `kill` misses grandchildren: only the direct child and supervisor are signalled, so children of `sh -c '...'` survive. | Fixed in 0.5.0 |
+| 18 | 2026-10-31 | owner review | 0.4.0 | Default heartbeats cost a turn every 2 minutes even with no new output; no back-off and no `--heartbeat-fixed`. | Fixed in 0.5.0 |
+| 19 | 2026-10-31 | owner review | 0.4.0 | A dead supervisor leaves a job `running` forever with no `lost` state. | Fixed in 0.5.0 |
+| 20 | 2026-10-31 | owner review | 0.4.0 | `tail`, `show` and heartbeat reads load the whole `output.log`; a multi-GB log costs unbounded memory. | Fixed in 0.5.0 |
+| 21 | 2026-10-31 | owner review | 0.4.0 | Job directories and files are world-readable; state root has default modes. | Fixed in 0.5.0 |
+| 22 | 2026-10-31 | owner review | 0.4.0 | Job output goes unsanitised into turns: `\r` progress bars, ANSI escapes and control bytes pass through. | Fixed in 0.5.0 |
+| 23 | 2026-10-31 | lead review | 0.5.0 | `kill` signals `-pgid` when the leader is gone (`leaderMatches \|\| groupAlive`), so a reused leader PID can hit an unrelated group. | Fixed in 0.5.0 |

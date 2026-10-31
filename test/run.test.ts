@@ -707,6 +707,7 @@ describe("0.2.4 fixes", () => {
       );
       const k = cli(home, ["kill", "sh-9999-reuse"]);
       expect(k.code).toBe(0);
+      expect(k.out).toContain("not signalled: its leader is gone");
       let alive = true;
       try {
         process.kill(otherPid, 0);
@@ -714,7 +715,7 @@ describe("0.2.4 fixes", () => {
         alive = false;
       }
       expect(alive).toBe(true);
-      expect(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).state).toBe("killed");
+      expect(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).state).toBe("lost");
     } finally {
       try {
         sleeper.kill();

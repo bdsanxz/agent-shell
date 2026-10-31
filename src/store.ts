@@ -27,6 +27,21 @@ export function defaultHeartbeatMs(): number {
   return DEFAULT_HEARTBEAT_MS;
 }
 
+/** Max bytes read from the tail of output.log in one go (256 KiB). */
+export const LOG_READ_CAP_BYTES = 256 * 1024;
+
+/** Cap for heartbeat back-off, injectable for tests via
+ * `AGENT_SHELL_HEARTBEAT_MAX_MS` (milliseconds). */
+export const DEFAULT_HEARTBEAT_MAX_MS = 30 * 60 * 1000;
+export function heartbeatMaxMs(): number {
+  const raw = process.env.AGENT_SHELL_HEARTBEAT_MAX_MS;
+  if (raw !== undefined && raw.trim() !== "") {
+    const n = Number(raw.trim());
+    if (Number.isFinite(n) && n >= 1000) return n;
+  }
+  return DEFAULT_HEARTBEAT_MAX_MS;
+}
+
 export interface Meta {
   id: string;
   name: string;
@@ -44,6 +59,10 @@ export interface Meta {
   child_lstart?: string | null;
   /** `ps -o lstart` output for the supervisor at start; null when unknown. */
   supervisor_lstart?: string | null;
+  /** Process group id of the job child (group leader); null when unknown. */
+  pgid?: number | null;
+  /** When true, heartbeat back-off is disabled; the base interval stays fixed. */
+  heartbeat_fixed?: boolean;
 }
 
 export interface Status {
@@ -65,6 +84,8 @@ export interface Status {
   last_heartbeat_detail: string;
   /** Start-up failure (missing executable, bad cwd, spawn error); null otherwise. */
   error: string | null;
+  /** Current heartbeat interval with back-off applied; null when disabled or unknown. */
+  heartbeat_current_ms?: number | null;
 }
 
 export function stateRoot(): string {
@@ -92,6 +113,8 @@ export function readMeta(dir: string): Meta | null {
     return {
       ...(raw as Meta),
       heartbeat_ms: raw.heartbeat_ms === undefined ? defaultHeartbeatMs() : raw.heartbeat_ms,
+      pgid: raw.pgid ?? null,
+      heartbeat_fixed: raw.heartbeat_fixed ?? false,
     };
   } catch {
     return null;
@@ -106,7 +129,13 @@ function atomicWrite(file: string, text: string): void {
 }
 
 export function writeMeta(dir: string, meta: Meta): void {
-  atomicWrite(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n");
+  const file = path.join(dir, "meta.json");
+  atomicWrite(file, JSON.stringify(meta, null, 2) + "\n");
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // best effort; the file is already written
+  }
 }
 
 export function readStatus(dir: string): Status | null {
@@ -123,6 +152,7 @@ export function readStatus(dir: string): Status | null {
       notify_route: raw.notify_route ?? null,
       notify_agent: raw.notify_agent ?? null,
       notify_note: raw.notify_note ?? null,
+      heartbeat_current_ms: raw.heartbeat_current_ms ?? null,
     };
   } catch {
     return null;
@@ -130,7 +160,13 @@ export function readStatus(dir: string): Status | null {
 }
 
 export function writeStatus(dir: string, status: Status): void {
-  atomicWrite(path.join(dir, "status.json"), JSON.stringify(status, null, 2) + "\n");
+  const file = path.join(dir, "status.json");
+  atomicWrite(file, JSON.stringify(status, null, 2) + "\n");
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // best effort
+  }
 }
 
 /** A short unique job id: `sh-<millis>-<pid>`, plus a suffix when taken. */
@@ -143,15 +179,62 @@ export function freshId(root: string): string {
   return `${base}-${nowMs() % 100000}`;
 }
 
-/** Last `n` lines of the job log (empty string when no log yet). */
-export function tailLog(dir: string, n: number): string {
-  let text: string;
+/** Read at most the last LOG_READ_CAP_BYTES of output.log, then take the
+ * last `n` lines. Returns the text plus whether the read hit the cap. */
+export function readTailDetailed(dir: string, n: number, cap = LOG_READ_CAP_BYTES): { text: string; truncated: boolean } {
+  const file = path.join(dir, "output.log");
+  let size = 0;
   try {
-    text = fs.readFileSync(path.join(dir, "output.log"), "utf8");
+    size = fs.statSync(file).size;
   } catch {
-    return "";
+    return { text: "", truncated: false };
   }
-  const lines = text.split("\n");
+  if (size <= 0) return { text: "", truncated: false };
+  const truncated = size > cap;
+  const start = truncated ? size - cap : 0;
+  const len = truncated ? cap : size;
+  let chunk = "";
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      chunk = buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return { text: "", truncated: false };
+  }
+  // When cut mid-file, the first line is partial; drop it.
+  if (truncated) {
+    const nl = chunk.indexOf("\n");
+    if (nl >= 0) chunk = chunk.slice(nl + 1);
+  }
+  const lines = chunk.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  return lines.slice(Math.max(0, lines.length - Math.max(1, n))).join("\n");
+  const out = lines.slice(Math.max(0, lines.length - Math.max(1, n))).join("\n");
+  return { text: out, truncated };
+}
+
+/** Last `n` lines of the job log (empty string when no log yet).
+ * Bounded: reads at most LOG_READ_CAP_BYTES from the end. */
+export function tailLog(dir: string, n: number): string {
+  return readTailDetailed(dir, n).text;
+}
+
+/** Collapse `\r` progress bars (keep text after the last `\r` on a line),
+ * strip ANSI CSI/OSC escapes and other control characters except `\n` and `\t`. */
+export function sanitiseOutput(text: string): string {
+  const lines = text.split("\n").map((line) => {
+    const afterCr = line.includes("\r") ? line.slice(line.lastIndexOf("\r") + 1) : line;
+    const ESC = "\u001b";
+    let s = afterCr.replace(new RegExp(ESC + "\\][^\u0007" + ESC + "]*(?:\u0007|" + ESC + "\\\\)", "g"), "");
+    s = s.replace(new RegExp(ESC + "\\[[0-9;?]*[ -/]*[@-~]", "g"), "");
+    s = s.replace(new RegExp(ESC + "[()#%*+][0-9A-Za-z]", "g"), "");
+    s = s.replace(new RegExp(ESC + ".", "g"), "");
+    s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+    return s;
+  });
+  return lines.join("\n");
 }
